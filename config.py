@@ -36,9 +36,9 @@ OPPOSITE_CLOSE_DELAY = int(os.getenv("OPPOSITE_CLOSE_DELAY", "3")) # Delay betwe
 # ==============================
 # 🔹 EXIT ORDER PARAMETERS
 # ==============================
-EXIT_MARKET_DELAY       = int(os.getenv("EXIT_MARKET_DELAY", "10"))  # Delay before market exit
+EXIT_MARKET_DELAY       = int(os.getenv("EXIT_MARKET_DELAY", "2"))  # Delay before market exit
 USE_BAR_HIGH_LOW_FOR_EXIT = os.getenv("USE_BAR_HIGH_LOW_FOR_EXIT", "True") == "True"
-EXIT_LIMIT_TIMEOUT      = int(os.getenv("EXIT_LIMIT_TIMEOUT", "5"))   # Timeout for limit exit fill
+EXIT_LIMIT_TIMEOUT      = int(os.getenv("EXIT_LIMIT_TIMEOUT", "1"))   # Timeout for limit exit fill
 
 # ==============================
 # 🔹 TELEGRAM & SUMMARY CONFIG
