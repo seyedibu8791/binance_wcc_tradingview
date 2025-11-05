@@ -5,7 +5,8 @@ import datetime
 from config import (
     TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID,
     TRADE_AMOUNT, LEVERAGE, BASE_URL, BINANCE_API_KEY,
-    USE_BAR_HIGH_LOW_FOR_EXIT, EXIT_MARKET_DELAY
+    USE_BAR_HIGH_LOW_FOR_EXIT, BAR_EXIT_TIMEOUT_SEC,
+    EXIT_MARKET_DELAY_ENABLED, EXIT_MARKET_DELAY,
 )
 
 # =======================
@@ -147,10 +148,14 @@ def interval_to_seconds(interval: str) -> int:
 # =======================
 def perform_exit(symbol, interval, reason="Auto Exit", delay=None):
     """Handles delayed exit logic or market exit directly"""
-    from app import execute_market_exit  # imported lazily to avoid circular import
+    from app import execute_market_exit  # avoid circular import
 
-    if delay and delay > 0:
-        print(f"⏳ Exit delay active: waiting {delay}s before exiting {symbol}")
+    # Optional delay
+    if EXIT_MARKET_DELAY_ENABLED and delay is None:
+        print(f"⏳ Configured exit delay: {EXIT_MARKET_DELAY}s for {symbol}")
+        time.sleep(EXIT_MARKET_DELAY)
+    elif delay and delay > 0:
+        print(f"⏳ Manual delay override: waiting {delay}s for {symbol}")
         time.sleep(delay)
 
     trade = trades.get(f"{symbol}_{interval.lower()}")
@@ -198,9 +203,10 @@ def monitor_2bar_exit():
 
                     if pnl_percent < 0:
                         if USE_BAR_HIGH_LOW_FOR_EXIT:
-                            print(f"📊 Using high/low-based exit for {symbol} with 5s fallback.")
+                            print(f"📊 Using high/low-based exit for {symbol}, {BAR_EXIT_TIMEOUT_SEC}s fallback.")
                             threading.Thread(
-                                target=lambda: perform_exit(symbol, interval, reason="2-bar close (bar-based)", delay=5),
+                                target=lambda: perform_exit(
+                                    symbol, interval, reason="2-bar close (bar-based)", delay=BAR_EXIT_TIMEOUT_SEC),
                                 daemon=True
                             ).start()
                         else:
