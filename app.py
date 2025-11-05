@@ -1,8 +1,13 @@
-#app.py ()
 from flask import Flask, request, jsonify
 import requests, hmac, hashlib, time, threading, os
 from config import *
-from trade_notifier import log_trade_entry, log_trade_exit, trades, send_telegram_message
+from trade_notifier import (
+    log_trade_entry,
+    log_trade_exit,
+    trades,
+    send_telegram_message,
+    interval_to_seconds,   # ✅ imported shared interval logic
+)
 
 app = Flask(__name__)
 
@@ -81,15 +86,6 @@ def calculate_quantity(symbol):
         return 0.001
 
 
-# ===== Helper: Interval Conversion =====
-def interval_to_seconds(interval):
-    mapping = {
-        "1m": 60, "3m": 180, "5m": 300, "15m": 900, "30m": 1800,
-        "1h": 3600, "2h": 7200, "4h": 14400, "1d": 86400
-    }
-    return mapping.get(interval, 60)
-
-
 # ===== Helper: Get Position Info =====
 def get_position_info(symbol):
     timestamp = int(time.time() * 1000)
@@ -111,7 +107,7 @@ def check_two_bar_exit(symbol):
             return
 
         interval_str = trade.get("interval", "1m")
-        interval_seconds = interval_to_seconds(interval_str)
+        interval_seconds = interval_to_seconds(interval_str)  # ✅ using shared function
 
         print(f"🕒 Starting 2-bar timer for {symbol} ({interval_str})")
         time.sleep(interval_seconds * 2)
@@ -123,12 +119,12 @@ def check_two_bar_exit(symbol):
         pnl = float(position_info.get("unRealizedProfit", 0))
         amt = abs(float(position_info.get("positionAmt", 0)))
         if amt == 0:
-            return  # position already closed
+            return  # already closed
 
         if pnl < 0:
             side = "BUY" if float(position_info["positionAmt"]) > 0 else "SELL"
             execute_market_exit(symbol, side)
-            send_telegram_message(f"2 bar close exit | {symbol} | PnL: {pnl:.4f}")
+            send_telegram_message(f"2 bar close exit | {symbol} ({interval_str}) | PnL: {pnl:.4f}")
             print(f"[AUTO-EXIT] {symbol}: 2 bar close exit, PnL={pnl:.4f}")
     except Exception as e:
         print(f"⚠️ Error in 2-bar exit check for {symbol}: {e}")
@@ -182,7 +178,7 @@ def wait_and_notify_filled_entry(symbol, side, order_id):
             log_trade_entry(symbol, side, order_id, avg_price)
             notified = True
 
-            # ✅ Start 2-bar timer only after order fills and if not already started
+            # ✅ Start 2-bar timer only once per entry
             trade = trades.get(symbol)
             if trade and not trade.get("two_bar_thread"):
                 trades[symbol]["two_bar_thread"] = True
@@ -190,7 +186,6 @@ def wait_and_notify_filled_entry(symbol, side, order_id):
 
         if status in ("FILLED", "CANCELED", "REJECTED", "EXPIRED"):
             break
-
         time.sleep(1)
 
 
@@ -229,46 +224,6 @@ def wait_and_notify_filled_exit(symbol, order_id):
         time.sleep(1)
 
 
-# ===== Residual Clean-up =====
-def clean_residual_positions(symbol):
-    try:
-        binance_signed_request("DELETE", "/fapi/v1/allOpenOrders", {"symbol": symbol})
-        pos_data = binance_signed_request("GET", "/fapi/v2/positionRisk", {"symbol": symbol})
-        if pos_data and abs(float(pos_data[0]["positionAmt"])) > 0.00001:
-            amt = abs(float(pos_data[0]["positionAmt"]))
-            side = "SELL" if float(pos_data[0]["positionAmt"]) > 0 else "BUY"
-            binance_signed_request("POST", "/fapi/v1/order", {
-                "symbol": symbol,
-                "side": side,
-                "type": "MARKET",
-                "quantity": round_quantity(symbol, amt)
-            })
-            print(f"🧹 Residual position cleaned for {symbol}")
-    except Exception as e:
-        print("⚠️ Residual cleanup failed:", e)
-
-
-# ===== Async Exit & Open =====
-def async_exit_and_open(symbol, new_side, limit_price):
-    def worker():
-        pos_data = binance_signed_request("GET", "/fapi/v2/positionRisk", {"symbol": symbol})
-        amt = float(pos_data[0]["positionAmt"]) if pos_data else 0
-        opposite_side = None
-
-        if amt > 0 and new_side == "SELL":
-            opposite_side = "BUY"
-        elif amt < 0 and new_side == "BUY":
-            opposite_side = "SELL"
-
-        if opposite_side:
-            execute_market_exit(symbol, opposite_side)
-            time.sleep(OPPOSITE_CLOSE_DELAY)
-
-        open_position(symbol, new_side, limit_price)
-
-    threading.Thread(target=worker, daemon=True).start()
-
-
 # ===== Webhook =====
 @app.route("/webhook", methods=["POST"])
 def webhook():
@@ -292,13 +247,9 @@ def webhook():
             trades[symbol] = trades.get(symbol, {})
             trades[symbol]["interval"] = interval
             async_exit_and_open(symbol, "SELL", close_price)
-        elif comment == "CROSS_EXIT_SHORT":
+        elif comment in ["CROSS_EXIT_SHORT", "EXIT_LONG"]:
             execute_market_exit(symbol, "BUY")
-        elif comment == "CROSS_EXIT_LONG":
-            execute_market_exit(symbol, "SELL")
-        elif comment == "EXIT_LONG":
-            execute_market_exit(symbol, "BUY")
-        elif comment == "EXIT_SHORT":
+        elif comment in ["CROSS_EXIT_LONG", "EXIT_SHORT"]:
             execute_market_exit(symbol, "SELL")
         else:
             return jsonify({"error": f"Unknown comment: {comment}"})
@@ -309,17 +260,15 @@ def webhook():
         return jsonify({"error": str(e)})
 
 
-# ===== Ping =====
 @app.route("/ping", methods=["GET"])
 def ping():
     return "pong", 200
 
 
-# ===== Self Ping =====
 def self_ping():
     while True:
         try:
-            requests.get(f"https://binance-wcc-tradingview.onrender.com/ping")
+            requests.get("https://binance-wcc-tradingview.onrender.com/ping")
         except:
             pass
         time.sleep(5 * 60)
@@ -328,7 +277,6 @@ def self_ping():
 threading.Thread(target=self_ping, daemon=True).start()
 
 
-# ===== Run Flask =====
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
