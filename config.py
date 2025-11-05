@@ -1,4 +1,6 @@
-#config.py
+# ==============================
+# config.py (Final Integrated)
+# ==============================
 
 import os
 
@@ -24,6 +26,7 @@ else:
     BINANCE_SECRET_KEY = LIVE_SECRET_KEY
     BASE_URL           = LIVE_BASE_URL
 
+
 # ==============================
 # 🔹 TRADING PARAMETERS
 # ==============================
@@ -33,26 +36,34 @@ MARGIN_TYPE         = os.getenv("MARGIN_TYPE", "ISOLATED")     # CROSS or ISOLAT
 MAX_ACTIVE_TRADES   = int(os.getenv("MAX_ACTIVE_TRADES", "5")) # Limit active trades
 OPPOSITE_CLOSE_DELAY = int(os.getenv("OPPOSITE_CLOSE_DELAY", "3")) # Delay between opposite close & new entry
 
+
 # ==============================
 # 🔹 EXIT ORDER PARAMETERS
 # ==============================
-EXIT_MARKET_DELAY       = int(os.getenv("EXIT_MARKET_DELAY", "2"))  # Delay before market exit
+# Delay before executing a market exit (in seconds)
+EXIT_MARKET_DELAY_ENABLED = os.getenv("EXIT_MARKET_DELAY_ENABLED", "True") == "True"
+EXIT_MARKET_DELAY         = int(os.getenv("EXIT_MARKET_DELAY", "2"))
+
+# Use bar high/low for limit exit with timeout fallback to market
 USE_BAR_HIGH_LOW_FOR_EXIT = os.getenv("USE_BAR_HIGH_LOW_FOR_EXIT", "True") == "True"
-EXIT_LIMIT_TIMEOUT      = int(os.getenv("EXIT_LIMIT_TIMEOUT", "1"))   # Timeout for limit exit fill
+BAR_EXIT_TIMEOUT_SEC      = int(os.getenv("BAR_EXIT_TIMEOUT_SEC", "5"))  # Wait before switching to market exit
+
 
 # ==============================
 # 🔹 TELEGRAM & SUMMARY CONFIG
 # ==============================
-TELEGRAM_BOT_TOKEN = "8282710007:AAFbcLUwHRrMrBJ5VacJQQFM27qxdCplwO4"
-TELEGRAM_CHAT_ID   = "-1003281678423"
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8282710007:AAFbcLUwHRrMrBJ5VacJQQFM27qxdCplwO4")
+TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "-1003281678423")
 
 # Daily summary time in IST (HH:MM format)
 DAILY_SUMMARY_TIME_IST = os.getenv("DAILY_SUMMARY_TIME_IST", "00:00")
+
 
 # ==============================
 # 🔹 LOGGING
 # ==============================
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")  # INFO, DEBUG, ERROR
+
 
 # ==============================
 # 🔹 CONFIG SUMMARY
@@ -60,13 +71,13 @@ LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")  # INFO, DEBUG, ERROR
 print(f"""
 📘 CONFIGURATION LOADED
 ------------------------------
-Environment:           {"TESTNET" if USE_TESTNET else "LIVE"}
-Leverage:              {LEVERAGE}x ({MARGIN_TYPE})
-Trade Amount:          ${TRADE_AMOUNT}
-Exit Market Delay:     {EXIT_MARKET_DELAY}s
-Exit Limit→Market:     {EXIT_LIMIT_TIMEOUT}s
-Use Bar High/Low:      {USE_BAR_HIGH_LOW_FOR_EXIT}
-Opposite Close Delay:  {OPPOSITE_CLOSE_DELAY}s
-Max Active Trades:     {MAX_ACTIVE_TRADES}
+Environment:             {"TESTNET" if USE_TESTNET else "LIVE"}
+Leverage:                {LEVERAGE}x ({MARGIN_TYPE})
+Trade Amount:            ${TRADE_AMOUNT}
+Use Bar High/Low Exit:   {USE_BAR_HIGH_LOW_FOR_EXIT}
+Bar Exit Timeout:        {BAR_EXIT_TIMEOUT_SEC}s
+Market Exit Delay:       {EXIT_MARKET_DELAY if EXIT_MARKET_DELAY_ENABLED else 'Disabled'}
+Opposite Close Delay:    {OPPOSITE_CLOSE_DELAY}s
+Max Active Trades:       {MAX_ACTIVE_TRADES}
 ------------------------------
 """)
