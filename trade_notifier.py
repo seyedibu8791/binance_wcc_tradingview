@@ -1,4 +1,3 @@
-# trade_notifier.py
 import requests
 import threading
 import time
@@ -6,10 +5,12 @@ import datetime
 from config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, TRADE_AMOUNT, LEVERAGE, BASE_URL, BINANCE_API_KEY
 
 # =======================
-# 🧾 STORAGE
+# 🧾 STORAGE + LOCK
 # =======================
 trades = {}  # {symbol_interval: {...}}
 notified_orders = set()
+trades_lock = threading.Lock()  # Prevent concurrent modification of trades
+
 
 # =======================
 # 📢 TELEGRAM HELPER
@@ -37,21 +38,21 @@ def log_trade_entry(symbol: str, side: str, order_id: str, filled_price: float, 
         return
     notified_orders.add(order_id)
 
-    # Unique key per symbol + interval
     key = f"{symbol}_{interval.lower()}"
 
-    trades[key] = {
-        "symbol": symbol,
-        "side": side,
-        "entry_price": filled_price,
-        "order_id": order_id,
-        "interval": interval.lower(),
-        "closed": False,
-        "exit_price": None,
-        "pnl": 0,
-        "pnl_percent": 0,
-        "entry_time": time.time(),
-    }
+    with trades_lock:
+        trades[key] = {
+            "symbol": symbol,
+            "side": side,
+            "entry_price": filled_price,
+            "order_id": order_id,
+            "interval": interval.lower(),
+            "closed": False,
+            "exit_price": None,
+            "pnl": 0,
+            "pnl_percent": 0,
+            "entry_time": time.time(),
+        }
 
     arrow = "⬆️" if side.upper() == "BUY" else "⬇️"
     trade_type = "Long Trade" if side.upper() == "BUY" else "Short Trade"
@@ -77,39 +78,41 @@ Entry Price: <b>{filled_price}</b>
 def log_trade_exit(symbol: str, order_id: str, filled_price: float, reason="Normal Exit", interval: str = "1m"):
     """Record and notify trade exit"""
     key = f"{symbol}_{interval.lower()}"
-    if key not in trades:
-        trades[key] = {
-            "symbol": symbol,
-            "side": "UNKNOWN",
-            "entry_price": filled_price,
-            "closed": True,
-            "exit_price": filled_price,
-            "pnl": 0,
-            "pnl_percent": 0,
-        }
 
-    trade = trades[key]
-    if trade["closed"]:
-        return  # avoid duplicate exit
+    with trades_lock:
+        if key not in trades:
+            trades[key] = {
+                "symbol": symbol,
+                "side": "UNKNOWN",
+                "entry_price": filled_price,
+                "closed": True,
+                "exit_price": filled_price,
+                "pnl": 0,
+                "pnl_percent": 0,
+            }
 
-    trade["exit_price"] = filled_price
-    trade["closed"] = True
+        trade = trades[key]
+        if trade["closed"]:
+            return
 
-    entry_price = trade["entry_price"]
-    side = trade["side"].upper()
-    qty = TRADE_AMOUNT
+        trade["exit_price"] = filled_price
+        trade["closed"] = True
 
-    if side == "BUY":
-        pnl = (filled_price - entry_price) * qty * LEVERAGE / entry_price
-        pnl_percent = ((filled_price - entry_price) / entry_price) * 100 * LEVERAGE
-    elif side == "SELL":
-        pnl = (entry_price - filled_price) * qty * LEVERAGE / entry_price
-        pnl_percent = ((entry_price - filled_price) / entry_price) * 100 * LEVERAGE
-    else:
-        pnl = pnl_percent = 0
+        entry_price = trade["entry_price"]
+        side = trade["side"].upper()
+        qty = TRADE_AMOUNT
 
-    trade["pnl"] = round(pnl, 2)
-    trade["pnl_percent"] = round(pnl_percent, 2)
+        if side == "BUY":
+            pnl = (filled_price - entry_price) * qty * LEVERAGE / entry_price
+            pnl_percent = ((filled_price - entry_price) / entry_price) * 100 * LEVERAGE
+        elif side == "SELL":
+            pnl = (entry_price - filled_price) * qty * LEVERAGE / entry_price
+            pnl_percent = ((entry_price - filled_price) / entry_price) * 100 * LEVERAGE
+        else:
+            pnl = pnl_percent = 0
+
+        trade["pnl"] = round(pnl, 2)
+        trade["pnl_percent"] = round(pnl_percent, 2)
 
     header = "Profit Achieved! ✅" if pnl >= 0 else "Ended in Loss! ⛔️"
 
@@ -118,7 +121,7 @@ Reason: <b>{reason}</b>
 PnL: {trade['pnl']}$ | {trade['pnl_percent']}%
 --- ⌁ ---
 Symbol: <b>#{symbol}</b>
-Interval: {trade.get('interval', '-')}
+Interval: {interval}
 --- ⌁ ---
 Entry: {trade['entry_price']}
 Exit: {trade['exit_price']}
@@ -127,7 +130,7 @@ Exit: {trade['exit_price']}
 
 
 # =======================
-# 🕒 Helper: Convert interval → seconds
+# 🕒 Convert interval → seconds
 # =======================
 def interval_to_seconds(interval: str) -> int:
     mapping = {
@@ -144,7 +147,10 @@ def monitor_2bar_exit():
     """Continuously checks open trades and exits after 2 bars if PnL < 0"""
     while True:
         try:
-            for key, trade in list(trades.items()):
+            with trades_lock:
+                current_trades = list(trades.items())
+
+            for key, trade in current_trades:
                 if trade.get("closed", True):
                     continue
 
@@ -153,7 +159,6 @@ def monitor_2bar_exit():
                 elapsed = time.time() - trade["entry_time"]
                 interval_sec = interval_to_seconds(interval)
 
-                # Proceed only after 2 full bars for that specific interval
                 if elapsed >= (2 * interval_sec):
                     headers = {"X-MBX-APIKEY": BINANCE_API_KEY}
                     resp = requests.get(f"{BASE_URL}/fapi/v1/ticker/price?symbol={symbol}", headers=headers)
@@ -178,7 +183,6 @@ def monitor_2bar_exit():
         time.sleep(30)
 
 
-# Start background 2-bar monitor
 threading.Thread(target=monitor_2bar_exit, daemon=True).start()
 
 
@@ -192,28 +196,29 @@ def send_daily_summary():
         next_run = now.replace(hour=0, minute=0, second=0, microsecond=0) + datetime.timedelta(days=1)
         time.sleep((next_run - now).total_seconds())
 
-        closed_trades = [t for t in trades.values() if t.get("closed")]
-        total_signals = len(trades)
-        profitable = sum(1 for t in closed_trades if t["pnl"] > 0)
-        lost = sum(1 for t in closed_trades if t["pnl"] < 0)
-        open_trades = sum(1 for t in trades.values() if not t["closed"])
-        net_pnl_percent = round(sum(t["pnl_percent"] for t in closed_trades), 2)
+        with trades_lock:
+            closed_trades = [t for t in trades.values() if t.get("closed")]
+            total_signals = len(trades)
+            profitable = sum(1 for t in closed_trades if t["pnl"] > 0)
+            lost = sum(1 for t in closed_trades if t["pnl"] < 0)
+            open_trades = sum(1 for t in trades.values() if not t["closed"])
+            net_pnl_percent = round(sum(t["pnl_percent"] for t in closed_trades), 2)
 
-        detailed_msg = ""
-        for t in closed_trades:
-            icon = "✅" if t["pnl"] > 0 else "⛔️"
-            detailed_msg += f"#{t['symbol']} {t['side']} {icon} | Entry: {t['entry_price']} | Exit: {t['exit_price']} | PnL%: {t['pnl_percent']} | PnL$: {t['pnl']}\n"
+            detailed_msg = ""
+            for t in closed_trades:
+                icon = "✅" if t["pnl"] > 0 else "⛔️"
+                detailed_msg += f"#{t['symbol']} {t['side']} {icon} | Entry: {t['entry_price']} | Exit: {t['exit_price']} | PnL%: {t['pnl_percent']} | PnL$: {t['pnl']}\n"
 
-        summary_msg = f"""{detailed_msg}
+            summary_msg = f"""{detailed_msg}
 👇🏻 <b>Signals Summary</b>
 ➕ Total Signals: {total_signals}
 ✔️ Profitable: {profitable}
 ✖️ Lost: {lost}
 ◼️ Open Trades: {open_trades}
 ✅ Net PnL %: {net_pnl_percent}%"""
-        send_telegram_message(summary_msg)
-        trades.clear()
+
+            send_telegram_message(summary_msg)
+            trades.clear()
 
 
-# Start daily summary thread
 threading.Thread(target=send_daily_summary, daemon=True).start()
