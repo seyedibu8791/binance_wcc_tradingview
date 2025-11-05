@@ -118,12 +118,12 @@ def get_exit_qty(symbol):
 def execute_exit(symbol, side, bar_high=None, bar_low=None, reason="Manual Exit"):
     """
     Unified exit logic:
-    - Optional delay before exit (EXIT_MARKET_DELAY)
+    - Optional delay before exit (EXIT_MARKET_DELAY_ENABLED + EXIT_MARKET_DELAY)
     - Try bar high/low limit exit if enabled
-    - Wait BAR_EXIT_TIMEOUT seconds, then fallback to market
+    - Wait BAR_EXIT_TIMEOUT_SEC seconds, then fallback to market
     """
     try:
-        if ENABLE_EXIT_MARKET_DELAY:
+        if EXIT_MARKET_DELAY_ENABLED:
             print(f"[{symbol}] Waiting {EXIT_MARKET_DELAY}s before exit...")
             time.sleep(EXIT_MARKET_DELAY)
 
@@ -141,7 +141,7 @@ def execute_exit(symbol, side, bar_high=None, bar_low=None, reason="Manual Exit"
             order_id = limit_order.get("orderId")
             start_time = time.time()
 
-            while time.time() - start_time < BAR_EXIT_TIMEOUT:
+            while time.time() - start_time < BAR_EXIT_TIMEOUT_SEC:
                 order_status = binance_signed_request("GET", "/fapi/v1/order", {
                     "symbol": symbol,
                     "orderId": order_id
@@ -152,7 +152,7 @@ def execute_exit(symbol, side, bar_high=None, bar_low=None, reason="Manual Exit"
                     return True
                 time.sleep(1)
 
-            print(f"[{symbol}] Limit not filled after {BAR_EXIT_TIMEOUT}s → switching to market exit")
+            print(f"[{symbol}] Limit not filled after {BAR_EXIT_TIMEOUT_SEC}s → switching to market exit")
 
         # Fallback to market exit
         execute_market_exit(symbol, side)
