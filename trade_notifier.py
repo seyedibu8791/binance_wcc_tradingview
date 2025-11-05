@@ -1,4 +1,4 @@
-# trade_notifier.py 
+# trade_notifier.py
 import requests
 import threading
 import time
@@ -8,7 +8,7 @@ from config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, TRADE_AMOUNT, LEVERAGE,
 # =======================
 # 🧾 STORAGE
 # =======================
-trades = {}  # {symbol: {...}}
+trades = {}  # {symbol_interval: {...}}
 notified_orders = set()
 
 # =======================
@@ -37,7 +37,11 @@ def log_trade_entry(symbol: str, side: str, order_id: str, filled_price: float, 
         return
     notified_orders.add(order_id)
 
-    trades[symbol] = {
+    # Unique key per symbol + interval
+    key = f"{symbol}_{interval.lower()}"
+
+    trades[key] = {
+        "symbol": symbol,
         "side": side,
         "entry_price": filled_price,
         "order_id": order_id,
@@ -70,10 +74,12 @@ Entry Price: <b>{filled_price}</b>
 # =======================
 # 🟥 TRADE EXIT
 # =======================
-def log_trade_exit(symbol: str, order_id: str, filled_price: float, reason="Normal Exit"):
+def log_trade_exit(symbol: str, order_id: str, filled_price: float, reason="Normal Exit", interval: str = "1m"):
     """Record and notify trade exit"""
-    if symbol not in trades:
-        trades[symbol] = {
+    key = f"{symbol}_{interval.lower()}"
+    if key not in trades:
+        trades[key] = {
+            "symbol": symbol,
             "side": "UNKNOWN",
             "entry_price": filled_price,
             "closed": True,
@@ -82,7 +88,7 @@ def log_trade_exit(symbol: str, order_id: str, filled_price: float, reason="Norm
             "pnl_percent": 0,
         }
 
-    trade = trades[symbol]
+    trade = trades[key]
     if trade["closed"]:
         return  # avoid duplicate exit
 
@@ -128,7 +134,7 @@ def interval_to_seconds(interval: str) -> int:
         "1m": 60, "3m": 180, "5m": 300, "15m": 900, "30m": 1800,
         "1h": 3600, "2h": 7200, "4h": 14400, "1d": 86400
     }
-    return mapping.get(interval, 60)
+    return mapping.get(interval.lower(), 60)
 
 
 # =======================
@@ -138,15 +144,16 @@ def monitor_2bar_exit():
     """Continuously checks open trades and exits after 2 bars if PnL < 0"""
     while True:
         try:
-            for symbol, trade in list(trades.items()):
+            for key, trade in list(trades.items()):
                 if trade.get("closed", True):
                     continue
 
+                symbol = trade["symbol"]
                 interval = trade.get("interval", "1m")
                 elapsed = time.time() - trade["entry_time"]
                 interval_sec = interval_to_seconds(interval)
 
-                # Proceed only after 2 full bars
+                # Proceed only after 2 full bars for that specific interval
                 if elapsed >= (2 * interval_sec):
                     headers = {"X-MBX-APIKEY": BINANCE_API_KEY}
                     resp = requests.get(f"{BASE_URL}/fapi/v1/ticker/price?symbol={symbol}", headers=headers)
@@ -162,17 +169,16 @@ def monitor_2bar_exit():
                     else:
                         pnl_percent = ((entry_price - current_price) / entry_price) * 100 * LEVERAGE
 
-                    # If PnL negative → mark as closed with reason
                     if pnl_percent < 0:
-                        log_trade_exit(symbol, trade["order_id"], current_price, reason="2 bar close exit")
-                        print(f"[2-Bar Auto Exit] {symbol} closed after 2 bars with {pnl_percent:.2f}% loss")
+                        log_trade_exit(symbol, trade["order_id"], current_price, reason=f"2 bar close exit ({interval})", interval=interval)
+                        print(f"[2-Bar Auto Exit] {symbol} ({interval}) closed after 2 bars with {pnl_percent:.2f}% loss")
         except Exception as e:
             print("⚠️ 2-Bar Monitor Error:", e)
 
-        time.sleep(30)  # check every 30 seconds
+        time.sleep(30)
 
 
-# Start background monitor thread
+# Start background 2-bar monitor
 threading.Thread(target=monitor_2bar_exit, daemon=True).start()
 
 
@@ -186,7 +192,7 @@ def send_daily_summary():
         next_run = now.replace(hour=0, minute=0, second=0, microsecond=0) + datetime.timedelta(days=1)
         time.sleep((next_run - now).total_seconds())
 
-        closed_trades = [t for t in trades.values() if t["closed"]]
+        closed_trades = [t for t in trades.values() if t.get("closed")]
         total_signals = len(trades)
         profitable = sum(1 for t in closed_trades if t["pnl"] > 0)
         lost = sum(1 for t in closed_trades if t["pnl"] < 0)
@@ -194,10 +200,9 @@ def send_daily_summary():
         net_pnl_percent = round(sum(t["pnl_percent"] for t in closed_trades), 2)
 
         detailed_msg = ""
-        for symbol, t in trades.items():
-            if t["closed"]:
-                icon = "✅" if t["pnl"] > 0 else "⛔️"
-                detailed_msg += f"#{symbol} {t['side']} {icon} | Entry: {t['entry_price']} | Exit: {t['exit_price']} | PnL%: {t['pnl_percent']} | PnL$: {t['pnl']}\n"
+        for t in closed_trades:
+            icon = "✅" if t["pnl"] > 0 else "⛔️"
+            detailed_msg += f"#{t['symbol']} {t['side']} {icon} | Entry: {t['entry_price']} | Exit: {t['exit_price']} | PnL%: {t['pnl_percent']} | PnL$: {t['pnl']}\n"
 
         summary_msg = f"""{detailed_msg}
 👇🏻 <b>Signals Summary</b>
@@ -210,5 +215,5 @@ def send_daily_summary():
         trades.clear()
 
 
-# Start daily summary in background
+# Start daily summary thread
 threading.Thread(target=send_daily_summary, daemon=True).start()
