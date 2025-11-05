@@ -6,12 +6,14 @@ from trade_notifier import (
     log_trade_exit,
     trades,
     send_telegram_message,
-    interval_to_seconds,   # ✅ imported shared interval logic
+    interval_to_seconds,  # ✅ unified interval logic
 )
 
 app = Flask(__name__)
 
-# ===== Binance Helpers =====
+# ===============================
+# 🔒 Binance Signed Request Helper
+# ===============================
 def binance_signed_request(http_method, path, params=None):
     if params is None:
         params = {}
@@ -33,6 +35,9 @@ def binance_signed_request(http_method, path, params=None):
         return {"error": str(e)}
 
 
+# ===============================
+# ⚙️ Leverage & Margin Setup
+# ===============================
 def set_leverage_and_margin(symbol):
     try:
         binance_signed_request("POST", "/fapi/v1/leverage", {"symbol": symbol, "leverage": LEVERAGE})
@@ -61,7 +66,9 @@ def round_quantity(symbol, qty):
     return round(qty, 8)
 
 
-# ===== Active Trades =====
+# ===============================
+# 📊 Position & Quantity Helpers
+# ===============================
 def count_active_trades():
     try:
         positions = binance_signed_request("GET", "/fapi/v2/positionRisk")
@@ -72,7 +79,6 @@ def count_active_trades():
         return 0
 
 
-# ===== Calculate Quantity =====
 def calculate_quantity(symbol):
     try:
         price_data = requests.get(f"{BASE_URL}/fapi/v1/ticker/price", params={"symbol": symbol}).json()
@@ -86,7 +92,6 @@ def calculate_quantity(symbol):
         return 0.001
 
 
-# ===== Helper: Get Position Info =====
 def get_position_info(symbol):
     timestamp = int(time.time() * 1000)
     query_string = f"symbol={symbol}&timestamp={timestamp}"
@@ -99,7 +104,106 @@ def get_position_info(symbol):
     return None
 
 
-# ===== 2-Bar Exit Logic =====
+# ===============================
+# 🧠 Unified Exit Logic
+# ===============================
+def get_exit_qty(symbol):
+    pos_data = binance_signed_request("GET", "/fapi/v2/positionRisk", {"symbol": symbol})
+    if not pos_data:
+        return 0
+    qty = abs(float(pos_data[0].get("positionAmt", 0)))
+    return round_quantity(symbol, qty)
+
+
+def execute_exit(symbol, side, bar_high=None, bar_low=None, reason="Manual Exit"):
+    """
+    Unified exit logic:
+    - Optional delay before exit (EXIT_MARKET_DELAY)
+    - Try bar high/low limit exit if enabled
+    - Wait BAR_EXIT_TIMEOUT seconds, then fallback to market
+    """
+    try:
+        if ENABLE_EXIT_MARKET_DELAY:
+            print(f"[{symbol}] Waiting {EXIT_MARKET_DELAY}s before exit...")
+            time.sleep(EXIT_MARKET_DELAY)
+
+        if USE_BAR_HIGH_LOW_FOR_EXIT and bar_high and bar_low:
+            limit_price = float(bar_low) if side == "BUY" else float(bar_high)
+            print(f"[{symbol}] Trying limit exit at {limit_price}")
+            limit_order = binance_signed_request("POST", "/fapi/v1/order", {
+                "symbol": symbol,
+                "side": "SELL" if side == "BUY" else "BUY",
+                "type": "LIMIT",
+                "timeInForce": "GTC",
+                "quantity": get_exit_qty(symbol),
+                "price": limit_price
+            })
+            order_id = limit_order.get("orderId")
+            start_time = time.time()
+
+            while time.time() - start_time < BAR_EXIT_TIMEOUT:
+                order_status = binance_signed_request("GET", "/fapi/v1/order", {
+                    "symbol": symbol,
+                    "orderId": order_id
+                })
+                if order_status.get("status") == "FILLED":
+                    log_trade_exit(symbol, order_id, limit_price, reason="Bar High/Low Exit")
+                    send_telegram_message(f"{symbol} exited via LIMIT | {reason}")
+                    return True
+                time.sleep(1)
+
+            print(f"[{symbol}] Limit not filled after {BAR_EXIT_TIMEOUT}s → switching to market exit")
+
+        # Fallback to market exit
+        execute_market_exit(symbol, side)
+        send_telegram_message(f"{symbol} exited via MARKET | {reason}")
+        return True
+
+    except Exception as e:
+        print(f"❌ Exit error for {symbol}: {e}")
+        send_telegram_message(f"⚠️ Exit error for {symbol}: {e}")
+        return False
+
+
+# ===============================
+# 💼 Market Exit (Fallback)
+# ===============================
+def execute_market_exit(symbol, side):
+    pos_data = binance_signed_request("GET", "/fapi/v2/positionRisk", {"symbol": symbol})
+    if not pos_data or abs(float(pos_data[0]["positionAmt"])) == 0:
+        print(f"⚠️ No active position for {symbol}")
+        return {"status": "no_position"}
+
+    qty = abs(float(pos_data[0]["positionAmt"]))
+    qty = round_quantity(symbol, qty)
+    close_side = "SELL" if side == "BUY" else "BUY"
+
+    response = binance_signed_request("POST", "/fapi/v1/order", {
+        "symbol": symbol,
+        "side": close_side,
+        "type": "MARKET",
+        "quantity": qty
+    })
+
+    if "orderId" in response:
+        threading.Thread(target=wait_and_notify_filled_exit, args=(symbol, response["orderId"]), daemon=True).start()
+
+    return response
+
+
+def wait_and_notify_filled_exit(symbol, order_id):
+    while True:
+        order_status = binance_signed_request("GET", "/fapi/v1/order", {"symbol": symbol, "orderId": order_id})
+        if order_status.get("status") == "FILLED":
+            filled_price = float(order_status.get("avgPrice") or order_status.get("price") or 0)
+            log_trade_exit(symbol, order_id, filled_price)
+            break
+        time.sleep(1)
+
+
+# ===============================
+# ⏱️ 2-Bar Exit Logic
+# ===============================
 def check_two_bar_exit(symbol):
     try:
         trade = trades.get(symbol)
@@ -107,11 +211,10 @@ def check_two_bar_exit(symbol):
             return
 
         interval_str = trade.get("interval", "1m")
-        interval_seconds = interval_to_seconds(interval_str)  # ✅ using shared function
+        interval_seconds = interval_to_seconds(interval_str)
+        print(f"🕒 Starting 2-bar check for {symbol} ({interval_str})")
 
-        print(f"🕒 Starting 2-bar timer for {symbol} ({interval_str})")
         time.sleep(interval_seconds * 2)
-
         position_info = get_position_info(symbol)
         if not position_info:
             return
@@ -125,12 +228,14 @@ def check_two_bar_exit(symbol):
             side = "BUY" if float(position_info["positionAmt"]) > 0 else "SELL"
             execute_market_exit(symbol, side)
             send_telegram_message(f"2 bar close exit | {symbol} ({interval_str}) | PnL: {pnl:.4f}")
-            print(f"[AUTO-EXIT] {symbol}: 2 bar close exit, PnL={pnl:.4f}")
+            print(f"[AUTO-EXIT] {symbol}: 2 bar close exit triggered")
     except Exception as e:
-        print(f"⚠️ Error in 2-bar exit check for {symbol}: {e}")
+        print(f"⚠️ 2-bar check error for {symbol}: {e}")
 
 
-# ===== Open Position =====
+# ===============================
+# 🚀 Open Position Logic
+# ===============================
 def open_position(symbol, side, limit_price):
     active_count = count_active_trades()
     if active_count >= MAX_ACTIVE_TRADES:
@@ -140,15 +245,15 @@ def open_position(symbol, side, limit_price):
     set_leverage_and_margin(symbol)
     qty = calculate_quantity(symbol)
 
-    if symbol not in trades or trades[symbol].get("closed", True):
-        trades[symbol] = {
-            "side": side,
-            "interval": trades.get(symbol, {}).get("interval", "1m"),
-            "entry_time": time.time(),
-            "closed": False,
-            "two_bar_thread": False
-        }
-        log_trade_entry(symbol, side, "PENDING", limit_price)
+    trades[symbol] = {
+        "side": side,
+        "interval": trades.get(symbol, {}).get("interval", "1m"),
+        "entry_time": time.time(),
+        "closed": False,
+        "two_bar_thread": False,
+    }
+
+    log_trade_entry(symbol, side, "PENDING", limit_price)
 
     response = binance_signed_request("POST", "/fapi/v1/order", {
         "symbol": symbol,
@@ -178,7 +283,6 @@ def wait_and_notify_filled_entry(symbol, side, order_id):
             log_trade_entry(symbol, side, order_id, avg_price)
             notified = True
 
-            # ✅ Start 2-bar timer only once per entry
             trade = trades.get(symbol)
             if trade and not trade.get("two_bar_thread"):
                 trades[symbol]["two_bar_thread"] = True
@@ -189,42 +293,9 @@ def wait_and_notify_filled_entry(symbol, side, order_id):
         time.sleep(1)
 
 
-# ===== Market Exit =====
-def execute_market_exit(symbol, side):
-    pos_data = binance_signed_request("GET", "/fapi/v2/positionRisk", {"symbol": symbol})
-    if not pos_data or abs(float(pos_data[0]["positionAmt"])) == 0:
-        print(f"⚠️ No active position for {symbol} to close.")
-        return {"status": "no_position"}
-
-    qty = abs(float(pos_data[0]["positionAmt"]))
-    qty = round_quantity(symbol, qty)
-    close_side = "SELL" if side == "BUY" else "BUY"
-
-    response = binance_signed_request("POST", "/fapi/v1/order", {
-        "symbol": symbol,
-        "side": close_side,
-        "type": "MARKET",
-        "quantity": qty
-    })
-
-    if "orderId" in response:
-        threading.Thread(target=wait_and_notify_filled_exit, args=(symbol, response["orderId"]), daemon=True).start()
-
-    return response
-
-
-def wait_and_notify_filled_exit(symbol, order_id):
-    while True:
-        order_status = binance_signed_request("GET", "/fapi/v1/order", {"symbol": symbol, "orderId": order_id})
-        if order_status.get("status") == "FILLED":
-            filled_price = float(order_status.get("avgPrice") or order_status.get("price") or 0)
-            log_trade_exit(symbol, order_id, filled_price)
-            clean_residual_positions(symbol)
-            break
-        time.sleep(1)
-
-
-# ===== Webhook =====
+# ===============================
+# 🌐 Webhook Endpoint
+# ===============================
 @app.route("/webhook", methods=["POST"])
 def webhook():
     data = request.get_data(as_text=True)
@@ -242,15 +313,15 @@ def webhook():
         if comment == "BUY_ENTRY":
             trades[symbol] = trades.get(symbol, {})
             trades[symbol]["interval"] = interval
-            async_exit_and_open(symbol, "BUY", close_price)
+            open_position(symbol, "BUY", close_price)
         elif comment == "SELL_ENTRY":
             trades[symbol] = trades.get(symbol, {})
             trades[symbol]["interval"] = interval
-            async_exit_and_open(symbol, "SELL", close_price)
+            open_position(symbol, "SELL", close_price)
         elif comment in ["CROSS_EXIT_SHORT", "EXIT_LONG"]:
-            execute_market_exit(symbol, "BUY")
+            execute_exit(symbol, "BUY", bar_high, bar_low, reason="Signal Exit")
         elif comment in ["CROSS_EXIT_LONG", "EXIT_SHORT"]:
-            execute_market_exit(symbol, "SELL")
+            execute_exit(symbol, "SELL", bar_high, bar_low, reason="Signal Exit")
         else:
             return jsonify({"error": f"Unknown comment: {comment}"})
 
