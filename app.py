@@ -1,5 +1,5 @@
 # ===============================
-# app.py (Final Integrated with Trade Notifier)
+# app.py (Final Integrated - Telegram Unified in trade_notifier)
 # ===============================
 
 from flask import Flask, request, jsonify
@@ -8,10 +8,10 @@ from config import *
 from trade_notifier import (
     log_trade_entry,
     log_trade_exit,
+    perform_exit,
     trades,
     interval_to_seconds,
     trades_lock,
-    send_telegram_message,  # ✅ Added import for unified Telegram sending
 )
 
 app = Flask(__name__)
@@ -126,10 +126,10 @@ def get_position_info(symbol):
 
 
 # ===============================
-# 🧠 Unified Exit Finalizer (Updated)
+# 🧠 Unified Exit Finalizer
 # ===============================
 def finalize_trade(symbol, reason):
-    """Fetch actual trade data from Binance and send unified Telegram exit."""
+    """Fetch actual trade data from Binance and log exit."""
     try:
         headers = {"X-MBX-APIKEY": BINANCE_API_KEY}
         resp = requests.get(f"{BASE_URL}/fapi/v1/userTrades?symbol={symbol}", headers=headers)
@@ -155,15 +155,7 @@ def finalize_trade(symbol, reason):
 
         pnl_percent = (realized_pnl / (qty * entry_price)) * 100 if entry_price > 0 else 0
 
-        # ✅ Unified Telegram formatting
-        log_trade_exit(
-            symbol=symbol,
-            order_id=order_id,
-            filled_price=filled_price,
-            reason=reason,
-            interval=interval
-        )
-
+        log_trade_exit(symbol, order_id, filled_price, reason, interval)
         print(f"[EXIT] {symbol} closed | {reason} | Exit: {filled_price} | PnL: {realized_pnl} ({pnl_percent:.2f}%)")
 
     except Exception as e:
@@ -188,7 +180,6 @@ def execute_exit(symbol, side, bar_high=None, bar_low=None, reason="Manual Exit"
             time.sleep(EXIT_MARKET_DELAY)
 
         if USE_BAR_HIGH_LOW_FOR_EXIT and bar_high and bar_low:
-            # ✅ Adjusted: BUY exits use HIGH (capture profit), SELL exits use LOW
             limit_price = float(bar_high) if side.upper() == "BUY" else float(bar_low)
             print(f"[{symbol}] Attempting limit exit @ {limit_price} ({side})")
 
@@ -215,7 +206,7 @@ def execute_exit(symbol, side, bar_high=None, bar_low=None, reason="Manual Exit"
                     return True
                 time.sleep(1)
 
-            print(f"[{symbol}] Limit not filled in {BAR_EXIT_TIMEOUT_SEC}s → switching to MARKET exit")
+            print(f"[{symbol}] Limit not filled → switching to MARKET exit")
 
         execute_market_exit(symbol, side, reason)
         return True
@@ -282,8 +273,9 @@ def check_two_bar_exit(symbol):
 
         if pnl < 0:
             side = "BUY" if float(position_info["positionAmt"]) > 0 else "SELL"
-            execute_exit(symbol, side, reason="2-bar Exit Triggered")
-            print(f"[AUTO-EXIT] {symbol}: 2-bar close exit")
+            execute_exit(symbol, side, reason="2-Bar Loss Exit")
+            print(f"[AUTO-EXIT] {symbol}: 2-bar loss exit triggered")
+
     except Exception as e:
         print(f"⚠️ 2-bar check error for {symbol}: {e}")
 
@@ -300,7 +292,7 @@ def open_position(symbol, side, limit_price):
     existing_pos = get_position_info(symbol)
     if existing_pos and abs(float(existing_pos["positionAmt"])) > 0:
         close_side = "BUY" if float(existing_pos["positionAmt"]) < 0 else "SELL"
-        execute_exit(symbol, close_side, reason="Opposite Signal / New Entry")
+        perform_exit(symbol, trades.get(symbol, {}).get("interval", "1m"), reason="Opposite Signal Exit")
 
     set_leverage_and_margin(symbol)
     qty = calculate_quantity(symbol)
@@ -381,9 +373,9 @@ def webhook():
         elif comment == "SELL_ENTRY":
             open_position(symbol, "SELL", close_price)
         elif comment in ["CROSS_EXIT_SHORT", "EXIT_LONG"]:
-            execute_exit(symbol, "BUY", bar_high, bar_low, reason="Signal Exit")
+            perform_exit(symbol, interval, reason="Signal Exit")
         elif comment in ["CROSS_EXIT_LONG", "EXIT_SHORT"]:
-            execute_exit(symbol, "SELL", bar_high, bar_low, reason="Signal Exit")
+            perform_exit(symbol, interval, reason="Signal Exit")
         else:
             return jsonify({"error": f"Unknown comment: {comment}"})
 
