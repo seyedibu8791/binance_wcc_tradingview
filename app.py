@@ -1,12 +1,17 @@
+# ===============================
+# app.py (Final Integrated with Trade Notifier)
+# ===============================
+
 from flask import Flask, request, jsonify
 import requests, hmac, hashlib, time, threading, os
 from config import *
 from trade_notifier import (
     log_trade_entry,
     log_trade_exit,
-    trades,                 # shared trades dict (per-symbol)
-    send_telegram_message,
-    interval_to_seconds,    # unified interval logic (kept in trade_notifier)
+    trades,
+    interval_to_seconds,
+    trades_lock,
+    send_telegram_message,  # ✅ Added import for unified Telegram sending
 )
 
 app = Flask(__name__)
@@ -14,8 +19,6 @@ app = Flask(__name__)
 # -------------------------
 # Interval normalization map
 # -------------------------
-# TradingView sometimes sends intervals as numeric strings (1/30/60).
-# Map those to canonical intervals used across the code.
 INTERVAL_MAP = {
     "1": "1m", "3": "3m", "5": "5m", "15": "15m", "30": "30m",
     "60": "1h", "120": "2h", "240": "4h", "1": "1m",
@@ -28,6 +31,7 @@ def normalize_interval(raw):
         return "1m"
     key = str(raw).strip()
     return INTERVAL_MAP.get(key, key).lower()
+
 
 # ===============================
 # 🔒 Binance Signed Request Helper
@@ -64,6 +68,9 @@ def set_leverage_and_margin(symbol):
         print("❌ Failed to set leverage/margin:", e)
 
 
+# ===============================
+# 📊 Quantity & Position Helpers
+# ===============================
 def get_symbol_info(symbol):
     info = requests.get(f"{BASE_URL}/fapi/v1/exchangeInfo").json()
     for s in info.get("symbols", []):
@@ -84,9 +91,6 @@ def round_quantity(symbol, qty):
     return round(qty, 8)
 
 
-# ===============================
-# 📊 Position & Quantity Helpers
-# ===============================
 def count_active_trades():
     try:
         positions = binance_signed_request("GET", "/fapi/v2/positionRisk")
@@ -103,8 +107,7 @@ def calculate_quantity(symbol):
         price = float(price_data["price"])
         position_value = TRADE_AMOUNT * LEVERAGE
         qty = position_value / price
-        qty = round_quantity(symbol, qty)
-        return qty
+        return round_quantity(symbol, qty)
     except Exception as e:
         print("❌ Failed to calculate quantity:", e)
         return 0.001
@@ -123,7 +126,52 @@ def get_position_info(symbol):
 
 
 # ===============================
-# 🧠 Unified Exit Logic
+# 🧠 Unified Exit Finalizer (Updated)
+# ===============================
+def finalize_trade(symbol, reason):
+    """Fetch actual trade data from Binance and send unified Telegram exit."""
+    try:
+        headers = {"X-MBX-APIKEY": BINANCE_API_KEY}
+        resp = requests.get(f"{BASE_URL}/fapi/v1/userTrades?symbol={symbol}", headers=headers)
+        if resp.status_code != 200:
+            print(f"⚠️ Binance trade fetch failed for {symbol}: {resp.text}")
+            return
+
+        trade_data = resp.json()
+        if not trade_data:
+            print(f"⚠️ No recent trade data for {symbol}")
+            return
+
+        last_trade = trade_data[-1]
+        filled_price = float(last_trade["price"])
+        realized_pnl = float(last_trade.get("realizedPnl", 0.0))
+        qty = float(last_trade["qty"])
+
+        with trades_lock:
+            trade = trades.get(symbol, {})
+            entry_price = trade.get("entry_price", filled_price)
+            interval = trade.get("interval", "1m")
+            order_id = trade.get("order_id", f"auto_{int(time.time())}")
+
+        pnl_percent = (realized_pnl / (qty * entry_price)) * 100 if entry_price > 0 else 0
+
+        # ✅ Unified Telegram formatting
+        log_trade_exit(
+            symbol=symbol,
+            order_id=order_id,
+            filled_price=filled_price,
+            reason=reason,
+            interval=interval
+        )
+
+        print(f"[EXIT] {symbol} closed | {reason} | Exit: {filled_price} | PnL: {realized_pnl} ({pnl_percent:.2f}%)")
+
+    except Exception as e:
+        print(f"❌ finalize_trade() error for {symbol}: {e}")
+
+
+# ===============================
+# 🧾 Exit Handlers
 # ===============================
 def get_exit_qty(symbol):
     pos_data = binance_signed_request("GET", "/fapi/v2/positionRisk", {"symbol": symbol})
@@ -134,61 +182,50 @@ def get_exit_qty(symbol):
 
 
 def execute_exit(symbol, side, bar_high=None, bar_low=None, reason="Manual Exit"):
-    """
-    Unified exit logic:
-    - Optional delay before exit (EXIT_MARKET_DELAY_ENABLED + EXIT_MARKET_DELAY)
-    - Try bar high/low limit exit if enabled
-    - Wait BAR_EXIT_TIMEOUT_SEC seconds, then fallback to market
-    """
     try:
-        # Respect config flag name in config.py
         if EXIT_MARKET_DELAY_ENABLED:
-            print(f"[{symbol}] Waiting {EXIT_MARKET_DELAY}s before exit...")
+            print(f"[{symbol}] Exit delay active → waiting {EXIT_MARKET_DELAY}s...")
             time.sleep(EXIT_MARKET_DELAY)
 
         if USE_BAR_HIGH_LOW_FOR_EXIT and bar_high and bar_low:
-            limit_price = float(bar_low) if side == "BUY" else float(bar_high)
-            print(f"[{symbol}] Trying limit exit at {limit_price}")
+            # ✅ Adjusted: BUY exits use HIGH (capture profit), SELL exits use LOW
+            limit_price = float(bar_high) if side.upper() == "BUY" else float(bar_low)
+            print(f"[{symbol}] Attempting limit exit @ {limit_price} ({side})")
+
             limit_order = binance_signed_request("POST", "/fapi/v1/order", {
                 "symbol": symbol,
-                "side": "SELL" if side == "BUY" else "BUY",
+                "side": "SELL" if side.upper() == "BUY" else "BUY",
                 "type": "LIMIT",
                 "timeInForce": "GTC",
                 "quantity": get_exit_qty(symbol),
                 "price": limit_price
             })
+
             order_id = limit_order.get("orderId")
             start_time = time.time()
 
-            # Use BAR_EXIT_TIMEOUT_SEC from config.py
             while time.time() - start_time < BAR_EXIT_TIMEOUT_SEC:
                 order_status = binance_signed_request("GET", "/fapi/v1/order", {
                     "symbol": symbol,
                     "orderId": order_id
                 })
                 if order_status.get("status") == "FILLED":
-                    log_trade_exit(symbol, order_id, limit_price, reason="Bar High/Low Exit")
-                    send_telegram_message(f"{symbol} exited via LIMIT | {reason}")
+                    print(f"[EXIT] {symbol} filled @ {limit_price}")
+                    finalize_trade(symbol, reason="Bar High/Low Exit")
                     return True
                 time.sleep(1)
 
-            print(f"[{symbol}] Limit not filled after {BAR_EXIT_TIMEOUT_SEC}s → switching to market exit")
+            print(f"[{symbol}] Limit not filled in {BAR_EXIT_TIMEOUT_SEC}s → switching to MARKET exit")
 
-        # Fallback to market exit
-        execute_market_exit(symbol, side)
-        send_telegram_message(f"{symbol} exited via MARKET | {reason}")
+        execute_market_exit(symbol, side, reason)
         return True
 
     except Exception as e:
         print(f"❌ Exit error for {symbol}: {e}")
-        send_telegram_message(f"⚠️ Exit error for {symbol}: {e}")
         return False
 
 
-# ===============================
-# 💼 Market Exit (Fallback)
-# ===============================
-def execute_market_exit(symbol, side):
+def execute_market_exit(symbol, side, reason="Market Exit"):
     pos_data = binance_signed_request("GET", "/fapi/v2/positionRisk", {"symbol": symbol})
     if not pos_data or abs(float(pos_data[0]["positionAmt"])) == 0:
         print(f"⚠️ No active position for {symbol}")
@@ -196,7 +233,7 @@ def execute_market_exit(symbol, side):
 
     qty = abs(float(pos_data[0]["positionAmt"]))
     qty = round_quantity(symbol, qty)
-    close_side = "SELL" if side == "BUY" else "BUY"
+    close_side = "SELL" if side.upper() == "BUY" else "BUY"
 
     response = binance_signed_request("POST", "/fapi/v1/order", {
         "symbol": symbol,
@@ -206,23 +243,22 @@ def execute_market_exit(symbol, side):
     })
 
     if "orderId" in response:
-        threading.Thread(target=wait_and_notify_filled_exit, args=(symbol, response["orderId"]), daemon=True).start()
+        threading.Thread(target=wait_and_finalize_exit, args=(symbol, response["orderId"], reason), daemon=True).start()
 
     return response
 
 
-def wait_and_notify_filled_exit(symbol, order_id):
+def wait_and_finalize_exit(symbol, order_id, reason):
     while True:
         order_status = binance_signed_request("GET", "/fapi/v1/order", {"symbol": symbol, "orderId": order_id})
         if order_status.get("status") == "FILLED":
-            filled_price = float(order_status.get("avgPrice") or order_status.get("price") or 0)
-            log_trade_exit(symbol, order_id, filled_price)
+            finalize_trade(symbol, reason)
             break
         time.sleep(1)
 
 
 # ===============================
-# ⏱️ 2-Bar Exit Logic (per-symbol interval only)
+# ⏱️ 2-Bar Exit Logic
 # ===============================
 def check_two_bar_exit(symbol):
     try:
@@ -230,12 +266,9 @@ def check_two_bar_exit(symbol):
         if not trade:
             return
 
-        # Use the interval exactly as stored for the symbol
         interval_str = normalize_interval(trade.get("interval", "1m"))
         interval_seconds = interval_to_seconds(interval_str)
-        print(f"🕒 Starting 2-bar check for {symbol} ({interval_str})")
-
-        # wait 2 bars (blocking in this thread)
+        print(f"🕒 2-bar check for {symbol} ({interval_str})")
         time.sleep(interval_seconds * 2)
 
         position_info = get_position_info(symbol)
@@ -245,15 +278,12 @@ def check_two_bar_exit(symbol):
         pnl = float(position_info.get("unRealizedProfit", 0))
         amt = abs(float(position_info.get("positionAmt", 0)))
         if amt == 0:
-            return  # already closed
+            return
 
         if pnl < 0:
             side = "BUY" if float(position_info["positionAmt"]) > 0 else "SELL"
-            # Use unified exit (this will try limit based on bar highs/lows if available)
-            # We don't have bar_high/low here; execute_market_exit used
-            execute_market_exit(symbol, side)
-            send_telegram_message(f"2 bar close exit | {symbol} ({interval_str}) | PnL: {pnl:.4f}")
-            print(f"[AUTO-EXIT] {symbol}: 2 bar close exit triggered")
+            execute_exit(symbol, side, reason="2-bar Exit Triggered")
+            print(f"[AUTO-EXIT] {symbol}: 2-bar close exit")
     except Exception as e:
         print(f"⚠️ 2-bar check error for {symbol}: {e}")
 
@@ -267,10 +297,14 @@ def open_position(symbol, side, limit_price):
         print(f"🚫 Max active trades reached ({active_count}/{MAX_ACTIVE_TRADES})")
         return {"status": "max_trades_reached"}
 
+    existing_pos = get_position_info(symbol)
+    if existing_pos and abs(float(existing_pos["positionAmt"])) > 0:
+        close_side = "BUY" if float(existing_pos["positionAmt"]) < 0 else "SELL"
+        execute_exit(symbol, close_side, reason="Opposite Signal / New Entry")
+
     set_leverage_and_margin(symbol)
     qty = calculate_quantity(symbol)
 
-    # store interval for this symbol earlier at webhook (no per-interval keys)
     trades[symbol] = {
         "side": side,
         "interval": trades.get(symbol, {}).get("interval", "1m"),
@@ -279,8 +313,8 @@ def open_position(symbol, side, limit_price):
         "two_bar_thread": False,
     }
 
-    # notify entry PENDING; actual filled notifications come from wait_and_notify_filled_entry
     log_trade_entry(symbol, side, "PENDING", limit_price, trades[symbol]["interval"])
+    print(f"[ENTRY] {symbol} {side} pending @ {limit_price}")
 
     response = binance_signed_request("POST", "/fapi/v1/order", {
         "symbol": symbol,
@@ -292,8 +326,7 @@ def open_position(symbol, side, limit_price):
     })
 
     if "orderId" in response:
-        order_id = response["orderId"]
-        threading.Thread(target=wait_and_notify_filled_entry, args=(symbol, side, order_id), daemon=True).start()
+        threading.Thread(target=wait_and_notify_filled_entry, args=(symbol, side, response["orderId"]), daemon=True).start()
 
     return response
 
@@ -306,13 +339,12 @@ def wait_and_notify_filled_entry(symbol, side, order_id):
         executed_qty = float(order_status.get("executedQty", 0))
         avg_price = float(order_status.get("avgPrice") or order_status.get("price") or 0)
 
-        # when partially/fully filled — log entry with the symbol's stored interval
         if not notified and status in ("PARTIALLY_FILLED", "FILLED") and executed_qty > 0:
             interval_for_symbol = trades.get(symbol, {}).get("interval", "1m")
             log_trade_entry(symbol, side, order_id, avg_price, interval_for_symbol)
+            print(f"[ENTRY FILLED] {symbol} {side} @ {avg_price}")
             notified = True
 
-            # start 2-bar check only once
             trade = trades.get(symbol)
             if trade and not trade.get("two_bar_thread"):
                 trades[symbol]["two_bar_thread"] = True
@@ -337,13 +369,10 @@ def webhook():
             ticker, comment, close_price, interval = parts[0], parts[1], parts[2], parts[-1]
             bar_high = bar_low = None
 
-        # normalize interval mapping like "60" -> "1h" etc
         interval = normalize_interval(interval)
-
         symbol = ticker.replace("USDT", "") + "USDT"
         close_price = float(close_price)
 
-        # store the interval on the trades dictionary (keyed by symbol only)
         trades[symbol] = trades.get(symbol, {})
         trades[symbol]["interval"] = interval
 
@@ -352,7 +381,6 @@ def webhook():
         elif comment == "SELL_ENTRY":
             open_position(symbol, "SELL", close_price)
         elif comment in ["CROSS_EXIT_SHORT", "EXIT_LONG"]:
-            # use bar_high/bar_low from webhook if available
             execute_exit(symbol, "BUY", bar_high, bar_low, reason="Signal Exit")
         elif comment in ["CROSS_EXIT_LONG", "EXIT_SHORT"]:
             execute_exit(symbol, "SELL", bar_high, bar_low, reason="Signal Exit")
@@ -383,7 +411,6 @@ def self_ping():
 
 
 threading.Thread(target=self_ping, daemon=True).start()
-
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 5000))
