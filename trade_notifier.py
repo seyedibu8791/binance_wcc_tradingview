@@ -1,5 +1,5 @@
 # ==============================
-# trade_notifier.py (FINAL INTEGRATED)
+# trade_notifier.py (FINAL INTEGRATED))
 # ==============================
 
 import requests
