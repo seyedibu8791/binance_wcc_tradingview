@@ -150,12 +150,10 @@ def perform_exit(symbol, interval, reason="Auto Exit", delay=None):
     """Handles delayed exit logic or market exit directly"""
     from app import execute_market_exit  # avoid circular import
 
-    # Optional delay
-    if EXIT_MARKET_DELAY_ENABLED and delay is None:
-        print(f"⏳ Configured exit delay: {EXIT_MARKET_DELAY}s for {symbol}")
-        time.sleep(EXIT_MARKET_DELAY)
-    elif delay and delay > 0:
-        print(f"⏳ Manual delay override: waiting {delay}s for {symbol}")
+    # Optional delay before executing exit
+    if EXIT_MARKET_DELAY_ENABLED:
+        delay = delay or EXIT_MARKET_DELAY
+        print(f"⏳ Exit delay enabled → waiting {delay}s for {symbol}")
         time.sleep(delay)
 
     trade = trades.get(f"{symbol}_{interval.lower()}")
@@ -186,6 +184,7 @@ def monitor_2bar_exit():
                 elapsed = time.time() - trade["entry_time"]
                 interval_sec = interval_to_seconds(interval)
 
+                # Trigger after 2 full bars
                 if elapsed >= (2 * interval_sec):
                     headers = {"X-MBX-APIKEY": BINANCE_API_KEY}
                     resp = requests.get(f"{BASE_URL}/fapi/v1/ticker/price?symbol={symbol}", headers=headers)
@@ -196,17 +195,16 @@ def monitor_2bar_exit():
                     entry_price = trade["entry_price"]
                     side = trade["side"].upper()
 
-                    if side == "BUY":
-                        pnl_percent = ((current_price - entry_price) / entry_price) * 100 * LEVERAGE
-                    else:
-                        pnl_percent = ((entry_price - current_price) / entry_price) * 100 * LEVERAGE
+                    pnl_percent = ((current_price - entry_price) / entry_price) * 100 * LEVERAGE if side == "BUY" \
+                        else ((entry_price - current_price) / entry_price) * 100 * LEVERAGE
 
+                    # Exit if loss after 2 bars
                     if pnl_percent < 0:
                         if USE_BAR_HIGH_LOW_FOR_EXIT:
-                            print(f"📊 Using high/low-based exit for {symbol}, {BAR_EXIT_TIMEOUT_SEC}s fallback.")
+                            print(f"📊 High/Low exit mode active ({BAR_EXIT_TIMEOUT_SEC}s fallback).")
                             threading.Thread(
-                                target=lambda: perform_exit(
-                                    symbol, interval, reason="2-bar close (bar-based)", delay=BAR_EXIT_TIMEOUT_SEC),
+                                target=lambda: perform_exit(symbol, interval, reason="2-bar close (bar-based)",
+                                                            delay=BAR_EXIT_TIMEOUT_SEC),
                                 daemon=True
                             ).start()
                         else:
@@ -217,7 +215,6 @@ def monitor_2bar_exit():
 
                         log_trade_exit(symbol, trade["order_id"], current_price,
                                        reason=f"2-bar close exit ({interval})", interval=interval)
-
                         print(f"[2-Bar Auto Exit] {symbol} ({interval}) closed with {pnl_percent:.2f}% loss")
 
         except Exception as e:
