@@ -4,12 +4,30 @@ from config import *
 from trade_notifier import (
     log_trade_entry,
     log_trade_exit,
-    trades,
+    trades,                 # shared trades dict (per-symbol)
     send_telegram_message,
-    interval_to_seconds,  # ✅ unified interval logic
+    interval_to_seconds,    # unified interval logic (kept in trade_notifier)
 )
 
 app = Flask(__name__)
+
+# -------------------------
+# Interval normalization map
+# -------------------------
+# TradingView sometimes sends intervals as numeric strings (1/30/60).
+# Map those to canonical intervals used across the code.
+INTERVAL_MAP = {
+    "1": "1m", "3": "3m", "5": "5m", "15": "15m", "30": "30m",
+    "60": "1h", "120": "2h", "240": "4h", "1": "1m",
+    "1m": "1m", "3m": "3m", "5m": "5m", "15m": "15m", "30m": "30m",
+    "1h": "1h", "2h": "2h", "4h": "4h", "1d": "1d", "D": "1d", "1D": "1d"
+}
+
+def normalize_interval(raw):
+    if raw is None:
+        return "1m"
+    key = str(raw).strip()
+    return INTERVAL_MAP.get(key, key).lower()
 
 # ===============================
 # 🔒 Binance Signed Request Helper
@@ -123,6 +141,7 @@ def execute_exit(symbol, side, bar_high=None, bar_low=None, reason="Manual Exit"
     - Wait BAR_EXIT_TIMEOUT_SEC seconds, then fallback to market
     """
     try:
+        # Respect config flag name in config.py
         if EXIT_MARKET_DELAY_ENABLED:
             print(f"[{symbol}] Waiting {EXIT_MARKET_DELAY}s before exit...")
             time.sleep(EXIT_MARKET_DELAY)
@@ -141,6 +160,7 @@ def execute_exit(symbol, side, bar_high=None, bar_low=None, reason="Manual Exit"
             order_id = limit_order.get("orderId")
             start_time = time.time()
 
+            # Use BAR_EXIT_TIMEOUT_SEC from config.py
             while time.time() - start_time < BAR_EXIT_TIMEOUT_SEC:
                 order_status = binance_signed_request("GET", "/fapi/v1/order", {
                     "symbol": symbol,
@@ -202,7 +222,7 @@ def wait_and_notify_filled_exit(symbol, order_id):
 
 
 # ===============================
-# ⏱️ 2-Bar Exit Logic
+# ⏱️ 2-Bar Exit Logic (per-symbol interval only)
 # ===============================
 def check_two_bar_exit(symbol):
     try:
@@ -210,11 +230,14 @@ def check_two_bar_exit(symbol):
         if not trade:
             return
 
-        interval_str = trade.get("interval", "1m")
+        # Use the interval exactly as stored for the symbol
+        interval_str = normalize_interval(trade.get("interval", "1m"))
         interval_seconds = interval_to_seconds(interval_str)
         print(f"🕒 Starting 2-bar check for {symbol} ({interval_str})")
 
+        # wait 2 bars (blocking in this thread)
         time.sleep(interval_seconds * 2)
+
         position_info = get_position_info(symbol)
         if not position_info:
             return
@@ -226,6 +249,8 @@ def check_two_bar_exit(symbol):
 
         if pnl < 0:
             side = "BUY" if float(position_info["positionAmt"]) > 0 else "SELL"
+            # Use unified exit (this will try limit based on bar highs/lows if available)
+            # We don't have bar_high/low here; execute_market_exit used
             execute_market_exit(symbol, side)
             send_telegram_message(f"2 bar close exit | {symbol} ({interval_str}) | PnL: {pnl:.4f}")
             print(f"[AUTO-EXIT] {symbol}: 2 bar close exit triggered")
@@ -245,6 +270,7 @@ def open_position(symbol, side, limit_price):
     set_leverage_and_margin(symbol)
     qty = calculate_quantity(symbol)
 
+    # store interval for this symbol earlier at webhook (no per-interval keys)
     trades[symbol] = {
         "side": side,
         "interval": trades.get(symbol, {}).get("interval", "1m"),
@@ -253,7 +279,8 @@ def open_position(symbol, side, limit_price):
         "two_bar_thread": False,
     }
 
-    log_trade_entry(symbol, side, "PENDING", limit_price)
+    # notify entry PENDING; actual filled notifications come from wait_and_notify_filled_entry
+    log_trade_entry(symbol, side, "PENDING", limit_price, trades[symbol]["interval"])
 
     response = binance_signed_request("POST", "/fapi/v1/order", {
         "symbol": symbol,
@@ -279,10 +306,13 @@ def wait_and_notify_filled_entry(symbol, side, order_id):
         executed_qty = float(order_status.get("executedQty", 0))
         avg_price = float(order_status.get("avgPrice") or order_status.get("price") or 0)
 
+        # when partially/fully filled — log entry with the symbol's stored interval
         if not notified and status in ("PARTIALLY_FILLED", "FILLED") and executed_qty > 0:
-            log_trade_entry(symbol, side, order_id, avg_price)
+            interval_for_symbol = trades.get(symbol, {}).get("interval", "1m")
+            log_trade_entry(symbol, side, order_id, avg_price, interval_for_symbol)
             notified = True
 
+            # start 2-bar check only once
             trade = trades.get(symbol)
             if trade and not trade.get("two_bar_thread"):
                 trades[symbol]["two_bar_thread"] = True
@@ -307,18 +337,22 @@ def webhook():
             ticker, comment, close_price, interval = parts[0], parts[1], parts[2], parts[-1]
             bar_high = bar_low = None
 
+        # normalize interval mapping like "60" -> "1h" etc
+        interval = normalize_interval(interval)
+
         symbol = ticker.replace("USDT", "") + "USDT"
         close_price = float(close_price)
 
+        # store the interval on the trades dictionary (keyed by symbol only)
+        trades[symbol] = trades.get(symbol, {})
+        trades[symbol]["interval"] = interval
+
         if comment == "BUY_ENTRY":
-            trades[symbol] = trades.get(symbol, {})
-            trades[symbol]["interval"] = interval
             open_position(symbol, "BUY", close_price)
         elif comment == "SELL_ENTRY":
-            trades[symbol] = trades.get(symbol, {})
-            trades[symbol]["interval"] = interval
             open_position(symbol, "SELL", close_price)
         elif comment in ["CROSS_EXIT_SHORT", "EXIT_LONG"]:
+            # use bar_high/bar_low from webhook if available
             execute_exit(symbol, "BUY", bar_high, bar_low, reason="Signal Exit")
         elif comment in ["CROSS_EXIT_LONG", "EXIT_SHORT"]:
             execute_exit(symbol, "SELL", bar_high, bar_low, reason="Signal Exit")
@@ -331,6 +365,9 @@ def webhook():
         return jsonify({"error": str(e)})
 
 
+# ===============================
+# Ping & Self-ping
+# ===============================
 @app.route("/ping", methods=["GET"])
 def ping():
     return "pong", 200
@@ -339,7 +376,7 @@ def ping():
 def self_ping():
     while True:
         try:
-            requests.get("https://binance-wcc-tradingview.onrender.com/ping")
+            requests.get(os.getenv("SELF_PING_URL", "https://binance-wcc-tradingview.onrender.com/ping"))
         except:
             pass
         time.sleep(5 * 60)
