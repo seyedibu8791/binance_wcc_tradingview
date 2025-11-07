@@ -85,7 +85,8 @@ def round_quantity(symbol, qty):
         return round(qty, 3)
     step_size = float([f["stepSize"] for f in info["filters"] if f["filterType"] == "LOT_SIZE"][0])
     min_qty = float([f["minQty"] for f in info["filters"] if f["filterType"] == "LOT_SIZE"][0])
-    qty = (qty // step_size) * step_size
+    # Align to step_size
+    qty = float(int(qty / step_size) * step_size)
     if qty < min_qty:
         qty = min_qty
     return round(qty, 8)
@@ -114,8 +115,9 @@ def calculate_quantity(symbol):
 
 
 def get_position_info(symbol):
+    # Signed endpoint
     timestamp = int(time.time() * 1000)
-    query_string = f"symbol={symbol}&timestamp={timestamp}"
+    query_string = f"timestamp={timestamp}&symbol={symbol}"
     signature = hmac.new(BINANCE_SECRET_KEY.encode(), query_string.encode(), hashlib.sha256).hexdigest()
     headers = {"X-MBX-APIKEY": BINANCE_API_KEY}
     url = f"{BASE_URL}/fapi/v2/positionRisk?{query_string}&signature={signature}"
@@ -125,13 +127,27 @@ def get_position_info(symbol):
     return None
 
 
+# ------------------------------
+# Helper: compute implied PnL from given exit price (dollars)
+# ------------------------------
+def compute_implied_pnl_dollar(entry_price, exit_price, position_qty, side):
+    # position_qty is absolute quantity (in base asset units)
+    # For BUY side: profit = (exit - entry) * qty
+    # For SELL side: profit = (entry - exit) * qty
+    if position_qty == 0:
+        return 0.0
+    if side.upper() == "BUY":
+        return (exit_price - entry_price) * position_qty
+    else:
+        return (entry_price - exit_price) * position_qty
+
+
 # ===============================
 # 🧠 Unified Exit Finalizer (Patched)
 # ===============================
 def finalize_trade(symbol, reason):
     """Fetch actual trade data from Binance and send unified Telegram exit."""
     try:
-        # ✅ Add timestamp & signature for authenticated request
         timestamp = int(time.time() * 1000)
         query_string = f"symbol={symbol}&timestamp={timestamp}"
         signature = hmac.new(BINANCE_SECRET_KEY.encode(), query_string.encode(), hashlib.sha256).hexdigest()
@@ -161,7 +177,7 @@ def finalize_trade(symbol, reason):
 
         pnl_percent = (realized_pnl / (qty * entry_price)) * 100 if entry_price > 0 else 0
 
-        # ✅ Unified Telegram formatting
+        # Unified Telegram formatting uses trade_notifier.log_trade_exit
         log_trade_exit(
             symbol=symbol,
             order_id=order_id,
@@ -171,6 +187,11 @@ def finalize_trade(symbol, reason):
         )
 
         print(f"[EXIT] {symbol} closed | {reason} | Exit: {filled_price} | PnL: {realized_pnl} ({pnl_percent:.2f}%)")
+
+        # Ensure local state cleared
+        with trades_lock:
+            if symbol in trades:
+                trades.pop(symbol, None)
 
     except Exception as e:
         print(f"❌ finalize_trade() error for {symbol}: {e}")
@@ -188,7 +209,21 @@ def get_exit_qty(symbol):
 
 
 def execute_exit(symbol, side, bar_high=None, bar_low=None, reason="Manual Exit"):
+    """
+    High-level exit path:
+    - Try limit exit using bar high/low if configured.
+    - Fallback to market exit.
+    - finalize_trade() will fetch real exit details and send telegram.
+    """
     try:
+        # Prevent exiting if entry hasn't been recorded as filled yet
+        with trades_lock:
+            t = trades.get(symbol)
+            if not t or t.get("entry_filled") is not True:
+                print(f"⚠️ {symbol} exit ignored — entry not yet confirmed filled.")
+                # If opposite/same/cross signals must close regardless, that logic will call execute_market_exit() directly.
+                return {"status": "entry_not_filled"}
+
         if EXIT_MARKET_DELAY_ENABLED:
             print(f"[{symbol}] Exit delay active → waiting {EXIT_MARKET_DELAY}s...")
             time.sleep(EXIT_MARKET_DELAY)
@@ -222,6 +257,7 @@ def execute_exit(symbol, side, bar_high=None, bar_low=None, reason="Manual Exit"
 
             print(f"[{symbol}] Limit not filled in {BAR_EXIT_TIMEOUT_SEC}s → switching to MARKET exit")
 
+        # Market fallback
         execute_market_exit(symbol, side, reason)
         return True
 
@@ -234,6 +270,10 @@ def execute_market_exit(symbol, side, reason="Market Exit"):
     pos_data = binance_signed_request("GET", "/fapi/v2/positionRisk", {"symbol": symbol})
     if not pos_data or abs(float(pos_data[0]["positionAmt"])) == 0:
         print(f"⚠️ No active position for {symbol}")
+        # Clear state if mismatch
+        with trades_lock:
+            if symbol in trades:
+                trades.pop(symbol, None)
         return {"status": "no_position"}
 
     qty = abs(float(pos_data[0]["positionAmt"]))
@@ -263,64 +303,86 @@ def wait_and_finalize_exit(symbol, order_id, reason):
 
 
 # ===============================
-# ⏱️ 2-Bar Exit Logic
+# ⏱️ 2-Bar Exit Logic (force market exit after 2 bars)
 # ===============================
-def check_two_bar_exit(symbol):
+def two_bar_force_exit_worker(symbol, interval_str):
+    """
+    Worker that waits for 2 bars (2 * interval_seconds) after entry_filled,
+    then force-closes at market (regardless of PnL) unless already closed.
+    """
     try:
-        trade = trades.get(symbol)
-        if not trade:
-            return
-
-        interval_str = normalize_interval(trade.get("interval", "1m"))
         interval_seconds = interval_to_seconds(interval_str)
-        print(f"🕒 2-bar check for {symbol} ({interval_str})")
-        time.sleep(interval_seconds * 2)
+        with trades_lock:
+            trade = trades.get(symbol)
+            if not trade:
+                return
+            entry_time = trade.get("entry_time", time.time())
+        # Wait until the entry was actually filled before starting the 2-bar countdown
+        # but we use entry_time which we set when filled in wait_and_notify_filled_entry
+        # Sleep until 2 bars after entry_time (if some time already passed, compute remaining)
+        target = entry_time + (2 * interval_seconds)
+        now = time.time()
+        remaining = target - now
+        if remaining > 0:
+            time.sleep(remaining)
 
-        position_info = get_position_info(symbol)
-        if not position_info:
+        # Before forcing exit, check if trade still exists and open
+        pos = get_position_info(symbol)
+        if not pos or abs(float(pos.get("positionAmt", 0))) == 0:
+            # Nothing to close
+            with trades_lock:
+                if symbol in trades:
+                    trades.pop(symbol, None)
             return
 
-        pnl = float(position_info.get("unRealizedProfit", 0))
-        amt = abs(float(position_info.get("positionAmt", 0)))
-        if amt == 0:
-            return
+        # Force market exit after 2 bars regardless of PnL
+        side = "BUY" if float(pos["positionAmt"]) > 0 else "SELL"
+        print(f"[2-BAR FORCE] {symbol} → forcing market exit after 2 bars.")
+        execute_market_exit(symbol, side, reason="2-bar Force Exit")
 
-        if pnl < 0:
-            side = "BUY" if float(position_info["positionAmt"]) > 0 else "SELL"
-            execute_exit(symbol, side, reason="2-bar Exit Triggered")
-            print(f"[AUTO-EXIT] {symbol}: 2-bar close exit")
     except Exception as e:
-        print(f"⚠️ 2-bar check error for {symbol}: {e}")
+        print(f"❌ two_bar_force_exit_worker error for {symbol}: {e}")
 
 
 # ===============================
 # 🚀 Open Position Logic
 # ===============================
 def open_position(symbol, side, limit_price):
+    """
+    Places entry limit order only if there is no existing open position for that symbol.
+    Starts a wait_and_notify_filled_entry thread to confirm fill and mark the trade.
+    """
+    # Check Binance for existing position
+    pos_info = get_position_info(symbol)
+    if pos_info and abs(float(pos_info.get("positionAmt", 0))) > 0:
+        print(f"🚫 Binance reports an active position for {symbol}. Ignoring entry signal.")
+        return {"status": "position_exists"}
+
     active_count = count_active_trades()
     if active_count >= MAX_ACTIVE_TRADES:
         print(f"🚫 Max active trades reached ({active_count}/{MAX_ACTIVE_TRADES})")
         return {"status": "max_trades_reached"}
 
-    existing_pos = get_position_info(symbol)
-    if existing_pos and abs(float(existing_pos["positionAmt"])) > 0:
-        close_side = "BUY" if float(existing_pos["positionAmt"]) < 0 else "SELL"
-        execute_exit(symbol, close_side, reason="Opposite Signal / New Entry")
-
     set_leverage_and_margin(symbol)
     qty = calculate_quantity(symbol)
 
-    trades[symbol] = {
-        "side": side,
-        "interval": trades.get(symbol, {}).get("interval", "1m"),
-        "entry_time": time.time(),
-        "closed": False,
-        "two_bar_thread": False,
-    }
+    # Initialize local trade placeholder - entry_filled False until we get a fill
+    with trades_lock:
+        trades[symbol] = {
+            "side": side.upper(),
+            "interval": trades.get(symbol, {}).get("interval", "1m"),
+            "entry_time": time.time(),   # set; will be updated to fill time when filled
+            "entry_filled": False,
+            "order_id": "PENDING",
+            "closed": False,
+            "two_bar_thread_started": False,
+        }
 
+    # Send a pending-entry telegram via trade_notifier but not counted as final entry alert
     log_trade_entry(symbol, side, "PENDING", limit_price, trades[symbol]["interval"])
     print(f"[ENTRY] {symbol} {side} pending @ {limit_price}")
 
+    # Place the limit order
     response = binance_signed_request("POST", "/fapi/v1/order", {
         "symbol": symbol,
         "side": side,
@@ -330,38 +392,130 @@ def open_position(symbol, side, limit_price):
         "price": limit_price
     })
 
+    # If order placed, monitor fill
     if "orderId" in response:
-        threading.Thread(target=wait_and_notify_filled_entry, args=(symbol, side, response["orderId"]), daemon=True).start()
+        order_id = response["orderId"]
+        # update order id in local state
+        with trades_lock:
+            if symbol in trades:
+                trades[symbol]["order_id"] = order_id
+        threading.Thread(target=wait_and_notify_filled_entry, args=(symbol, side, order_id), daemon=True).start()
 
     return response
 
 
 def wait_and_notify_filled_entry(symbol, side, order_id):
+    """
+    Monitors order until partially/fully filled. When fill starts, send a single entry Telegram
+    with actual Binance fill price and start the 2-bar force-exit worker.
+    """
     notified = False
-    while True:
-        order_status = binance_signed_request("GET", "/fapi/v1/order", {"symbol": symbol, "orderId": order_id})
-        status = order_status.get("status")
-        executed_qty = float(order_status.get("executedQty", 0))
-        avg_price = float(order_status.get("avgPrice") or order_status.get("price") or 0)
+    try:
+        while True:
+            order_status = binance_signed_request("GET", "/fapi/v1/order", {"symbol": symbol, "orderId": order_id})
+            status = order_status.get("status")
+            executed_qty = float(order_status.get("executedQty", 0) or 0)
+            avg_price = float(order_status.get("avgPrice") or order_status.get("price") or 0)
 
-        if not notified and status in ("PARTIALLY_FILLED", "FILLED") and executed_qty > 0:
-            interval_for_symbol = trades.get(symbol, {}).get("interval", "1m")
-            log_trade_entry(symbol, side, order_id, avg_price, interval_for_symbol)
-            print(f"[ENTRY FILLED] {symbol} {side} @ {avg_price}")
-            notified = True
+            if not notified and status in ("PARTIALLY_FILLED", "FILLED") and executed_qty > 0:
+                # Mark entry as filled and update entry price/time
+                with trades_lock:
+                    trade = trades.get(symbol, {})
+                    trade["entry_filled"] = True
+                    trade["entry_price"] = avg_price
+                    trade["entry_time"] = time.time()
+                    trade["order_id"] = order_id
+                    trade["position_qty"] = executed_qty  # store base asset qty
+                # Send only one entry notification (actual Binance price)
+                log_trade_entry(symbol, side, order_id, avg_price, trade.get("interval", "1m"))
+                print(f"[ENTRY FILLED] {symbol} {side} @ {avg_price}")
+                notified = True
 
-            trade = trades.get(symbol)
-            if trade and not trade.get("two_bar_thread"):
-                trades[symbol]["two_bar_thread"] = True
-                threading.Thread(target=check_two_bar_exit, args=(symbol,), daemon=True).start()
+                # Start 2-bar force exit thread once per trade
+                with trades_lock:
+                    if not trades.get(symbol, {}).get("two_bar_thread_started"):
+                        trades[symbol]["two_bar_thread_started"] = True
+                        interval_for_symbol = trades[symbol].get("interval", "1m")
+                        threading.Thread(target=two_bar_force_exit_worker, args=(symbol, interval_for_symbol), daemon=True).start()
 
-        if status in ("FILLED", "CANCELED", "REJECTED", "EXPIRED"):
-            break
-        time.sleep(1)
+            if status in ("FILLED", "CANCELED", "REJECTED", "EXPIRED"):
+                break
+            time.sleep(1)
+    except Exception as e:
+        print(f"❌ wait_and_notify_filled_entry error for {symbol}: {e}")
 
 
 # ===============================
-# 🌐 Webhook Endpoint
+# Evaluate exit-signal (does not always close immediately)
+# ===============================
+def evaluate_exit_signal(symbol, alert_close_price, alert_side, bar_high=None, bar_low=None):
+    """
+    Called when a TradingView EXIT alert is received.
+    - If there is no open position -> ignore.
+    - If the alert arrives during the 2-bar wait, compare implied PnL from alert_close_price with current Binance unrealized PnL:
+        - If alert_implied_pnl_dollar < current_unrealized_pnl_dollar => close immediately.
+        - Else => do nothing (allow 2-bar timer to finish).
+    - If the alert arrives after 2 bars or 2-bar timer already finished, close immediately.
+    """
+    try:
+        pos = get_position_info(symbol)
+        if not pos or abs(float(pos.get("positionAmt", 0))) == 0:
+            print(f"⚠️ evaluate_exit_signal: no active position for {symbol}. Ignoring exit alert.")
+            # Ensure local state cleared
+            with trades_lock:
+                if symbol in trades:
+                    trades.pop(symbol, None)
+            return {"status": "no_position"}
+
+        # get Binance current unrealized profit in dollars (unRealizedProfit field)
+        current_unrealized_pnl = float(pos.get("unRealizedProfit", 0.0))
+        position_amt = abs(float(pos.get("positionAmt", 0.0)))
+        side = "BUY" if float(pos.get("positionAmt", 0.0)) > 0 else "SELL"
+
+        # get stored entry price (prefer local, fallback to pos entryPrice)
+        with trades_lock:
+            trade = trades.get(symbol, {})
+            entry_price = trade.get("entry_price", float(pos.get("entryPrice", 0.0)))
+            entry_time = trade.get("entry_time", time.time())
+            entry_filled = trade.get("entry_filled", False)
+
+        # compute implied pnl (dollar) from alert close price using actual position qty
+        alert_close_price = float(alert_close_price)
+        implied_pnl_from_alert = compute_implied_pnl_dollar(entry_price, alert_close_price, position_amt, side)
+
+        # Determine if we are still inside 2-bar window
+        interval_str = trade.get("interval", "1m")
+        interval_seconds = interval_to_seconds(interval_str)
+        two_bar_end = entry_time + (2 * interval_seconds)
+        now = time.time()
+
+        print(f"[EXIT EVAL] {symbol} | now={now}, two_bar_end={two_bar_end} | current_unrealized={current_unrealized_pnl:.4f} | alert_implied={implied_pnl_from_alert:.4f}")
+
+        if now < two_bar_end:
+            # inside 2-bar window -> compare
+            # If alert_implied_pnl_dollar < current_unrealized_pnl -> exit immediately
+            # (alert suggests a worse outcome than current)
+            if implied_pnl_from_alert < current_unrealized_pnl:
+                print(f"[EXIT EVAL] {symbol} → alert_implied_pnl {implied_pnl_from_alert:.4f} < current_unrealized {current_unrealized_pnl:.4f} → closing now.")
+                # close immediately at market
+                execute_market_exit(symbol, side, reason="Exit Signal (early close)")
+                return {"status": "closed_early"}
+            else:
+                print(f"[EXIT EVAL] {symbol} → alert_implied_pnl not worse. Waiting for 2-bar end.")
+                return {"status": "wait_2bar"}
+        else:
+            # after 2-bar window -> close immediately
+            print(f"[EXIT EVAL] {symbol} → after 2-bar end -> closing now.")
+            execute_market_exit(symbol, side, reason="Exit Signal (post 2-bar)")
+            return {"status": "closed_post_2bar"}
+
+    except Exception as e:
+        print(f"❌ evaluate_exit_signal error for {symbol}: {e}")
+        return {"error": str(e)}
+
+
+# ===============================
+# Webhook Endpoint
 # ===============================
 @app.route("/webhook", methods=["POST"])
 def webhook():
@@ -378,21 +532,41 @@ def webhook():
         symbol = ticker.replace("USDT", "") + "USDT"
         close_price = float(close_price)
 
-        trades[symbol] = trades.get(symbol, {})
-        trades[symbol]["interval"] = interval
+        # initialize interval in trades state if not present
+        with trades_lock:
+            trades[symbol] = trades.get(symbol, {})
+            trades[symbol]["interval"] = interval
 
+        # ENTRY signals
         if comment == "BUY_ENTRY":
-            open_position(symbol, "BUY", close_price)
+            # only open if no existing Binance position
+            return jsonify(open_position(symbol, "BUY", close_price))
         elif comment == "SELL_ENTRY":
-            open_position(symbol, "SELL", close_price)
-        elif comment in ["CROSS_EXIT_SHORT", "EXIT_LONG"]:
-            execute_exit(symbol, "BUY", bar_high, bar_low, reason="Signal Exit")
-        elif comment in ["CROSS_EXIT_LONG", "EXIT_SHORT"]:
-            execute_exit(symbol, "SELL", bar_high, bar_low, reason="Signal Exit")
+            return jsonify(open_position(symbol, "SELL", close_price))
+
+        # CROSS / OPPOSITE / SAME-SIDE signals => immediate close regardless of PnL
+        elif comment in ["CROSS_EXIT_SHORT", "CROSS_EXIT_LONG", "OPPOSITE_EXIT", "SAME_SIDE_EXIT"]:
+            # If position exists, close immediately at market
+            pos = get_position_info(symbol)
+            if pos and abs(float(pos.get("positionAmt", 0))) > 0:
+                side = "BUY" if float(pos.get("positionAmt")) > 0 else "SELL"
+                execute_market_exit(symbol, side, reason=f"Signal: {comment}")
+                return jsonify({"status": "closed_by_opposite_same_cross"})
+            else:
+                # no position — ensure local state cleared
+                with trades_lock:
+                    trades.pop(symbol, None)
+                return jsonify({"status": "no_position"})
+
+        # EXIT signals (informational; may close early if implied PnL is worse than current)
+        elif comment in ["EXIT_LONG", "EXIT_SHORT", "SIGNAL_EXIT"]:
+            # Evaluate exit: may close immediately or wait
+            result = evaluate_exit_signal(symbol, close_price, comment, bar_high, bar_low)
+            return jsonify(result)
+
         else:
             return jsonify({"error": f"Unknown comment: {comment}"})
 
-        return jsonify({"status": "ok"})
     except Exception as e:
         print("❌ Webhook Error:", e)
         return jsonify({"error": str(e)})
