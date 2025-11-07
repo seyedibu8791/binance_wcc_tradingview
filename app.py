@@ -1,5 +1,5 @@
 # ===============================
-# app.py (Final Integrated with Trade Notifier)
+# app.py 
 # ===============================
 
 from flask import Flask, request, jsonify
@@ -126,13 +126,19 @@ def get_position_info(symbol):
 
 
 # ===============================
-# 🧠 Unified Exit Finalizer (Updated)
+# 🧠 Unified Exit Finalizer (Patched)
 # ===============================
 def finalize_trade(symbol, reason):
     """Fetch actual trade data from Binance and send unified Telegram exit."""
     try:
+        # ✅ Add timestamp & signature for authenticated request
+        timestamp = int(time.time() * 1000)
+        query_string = f"symbol={symbol}&timestamp={timestamp}"
+        signature = hmac.new(BINANCE_SECRET_KEY.encode(), query_string.encode(), hashlib.sha256).hexdigest()
         headers = {"X-MBX-APIKEY": BINANCE_API_KEY}
-        resp = requests.get(f"{BASE_URL}/fapi/v1/userTrades?symbol={symbol}", headers=headers)
+
+        url = f"{BASE_URL}/fapi/v1/userTrades?{query_string}&signature={signature}"
+        resp = requests.get(url, headers=headers)
         if resp.status_code != 200:
             print(f"⚠️ Binance trade fetch failed for {symbol}: {resp.text}")
             return
@@ -188,7 +194,6 @@ def execute_exit(symbol, side, bar_high=None, bar_low=None, reason="Manual Exit"
             time.sleep(EXIT_MARKET_DELAY)
 
         if USE_BAR_HIGH_LOW_FOR_EXIT and bar_high and bar_low:
-            # ✅ Adjusted: BUY exits use HIGH (capture profit), SELL exits use LOW
             limit_price = float(bar_high) if side.upper() == "BUY" else float(bar_low)
             print(f"[{symbol}] Attempting limit exit @ {limit_price} ({side})")
 
