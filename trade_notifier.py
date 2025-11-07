@@ -1,5 +1,5 @@
 # ==============================
-# trade_notifier.py (FINAL FIXED)
+# trade_notifier.py (FINAL SYNCED)
 # ==============================
 
 import threading
@@ -63,8 +63,7 @@ Trade Amount: {TRADE_AMOUNT}$
 --- ⌁ ---
 Entry Price: <b>{filled_price}</b>
 --- ⌁ ---
-🕐 Wait for Exit Signal..
-"""
+🕐 Wait for Exit Signal.."""
     send_telegram_message(msg)
     print(f"[ENTRY] {symbol} {side.upper()} @ {filled_price} ({interval})")
 
@@ -72,8 +71,15 @@ Entry Price: <b>{filled_price}</b>
 # ==============================
 # 🟥 LOG TRADE EXIT
 # ==============================
-def log_trade_exit(symbol: str, filled_price: float, pnl: float = 0.0, pnl_percent: float = 0.0,
-                   reason: str = "Exit", interval: str = "1m", order_id: str = None):
+def log_trade_exit(
+    symbol: str,
+    filled_price: float,
+    pnl: float = 0.0,
+    pnl_percent: float = 0.0,
+    reason: str = "Exit",
+    interval: str = "1m",
+    order_id: str | None = None,
+):
     """Store exit + send Telegram alert"""
     key = f"{symbol}_{interval.lower()}"
 
