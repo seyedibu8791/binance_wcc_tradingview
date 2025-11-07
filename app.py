@@ -439,10 +439,6 @@ def open_position(symbol, side, limit_price, interval="1m"):
             "two_bar_thread_started": False,
         }
 
-    # Send a pending-entry telegram via trade_notifier (pending)
-    log_trade_entry(symbol, side, limit_price, order_id="PENDING", interval=interval)
-    print(f"[ENTRY] {symbol} {side} pending @ {limit_price} ({interval})")
-
     # Place the limit order
     response = binance_signed_request("POST", "/fapi/v1/order", {
         "symbol": symbol,
