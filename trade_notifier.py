@@ -35,7 +35,7 @@ def send_telegram_message(message: str):
 # ==============================
 # 🟩 LOG TRADE ENTRY
 # ==============================
-def log_trade_entry(symbol: str, side: str, order_id: str, filled_price: float, interval: str = "1m"):
+def log_trade_exit(symbol: str, order_id: str = None, filled_price: float = 0.0, reason="Normal Exit", interval: str = "1m"):
     """Store entry data + send Telegram alert"""
     key = f"{symbol}_{interval.lower()}"
 
