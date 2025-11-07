@@ -1,14 +1,16 @@
 # ==============================
-# trade_notifier.py (FINAL INTEGRATED))
+# trade_notifier.py (FINAL INTEGRATED + FIXED finalize_trade)
 # ==============================
 
 import requests
 import threading
 import time
 import datetime
+import hmac
+import hashlib
 from config import (
     TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID,
-    TRADE_AMOUNT, LEVERAGE, BASE_URL, BINANCE_API_KEY,
+    TRADE_AMOUNT, LEVERAGE, BASE_URL, BINANCE_API_KEY, BINANCE_SECRET_KEY,
     USE_BAR_HIGH_LOW_FOR_EXIT, BAR_EXIT_TIMEOUT_SEC,
     EXIT_MARKET_DELAY_ENABLED, EXIT_MARKET_DELAY,
 )
@@ -127,6 +129,56 @@ Exit: {trade['exit_price']}
 
 
 # ==============================
+# ⚖️ FINALIZE TRADE (with timestamp + signature fix)
+# ==============================
+def finalize_trade(symbol, reason):
+    """Fetch actual trade data from Binance and send unified Telegram exit."""
+    try:
+        timestamp = int(time.time() * 1000)
+        query_string = f"symbol={symbol}&timestamp={timestamp}"
+        signature = hmac.new(BINANCE_SECRET_KEY.encode(), query_string.encode(), hashlib.sha256).hexdigest()
+        headers = {"X-MBX-APIKEY": BINANCE_API_KEY}
+
+        url = f"{BASE_URL}/fapi/v1/userTrades?{query_string}&signature={signature}"
+        resp = requests.get(url, headers=headers)
+
+        if resp.status_code != 200:
+            print(f"⚠️ Binance trade fetch failed for {symbol}: {resp.text}")
+            return
+
+        trade_data = resp.json()
+        if not trade_data:
+            print(f"⚠️ No recent trade data for {symbol}")
+            return
+
+        last_trade = trade_data[-1]
+        filled_price = float(last_trade["price"])
+        realized_pnl = float(last_trade.get("realizedPnl", 0.0))
+        qty = float(last_trade["qty"])
+
+        with trades_lock:
+            trade = trades.get(symbol, {})
+            entry_price = trade.get("entry_price", filled_price)
+            interval = trade.get("interval", "1m")
+            order_id = trade.get("order_id", f"auto_{int(time.time())}")
+
+        pnl_percent = (realized_pnl / (qty * entry_price)) * 100 if entry_price > 0 else 0
+
+        log_trade_exit(
+            symbol=symbol,
+            order_id=order_id,
+            filled_price=filled_price,
+            reason=reason,
+            interval=interval
+        )
+
+        print(f"[EXIT] {symbol} closed | {reason} | Exit: {filled_price} | PnL: {realized_pnl} ({pnl_percent:.2f}%)")
+
+    except Exception as e:
+        print(f"❌ finalize_trade() error for {symbol}: {e}")
+
+
+# ==============================
 # ⏱️ INTERVAL → SECONDS
 # ==============================
 def interval_to_seconds(interval: str) -> int:
@@ -158,7 +210,6 @@ def perform_exit(symbol, interval, reason="Auto Exit"):
     execute_market_exit(symbol, side)
     print(f"[EXIT] Market exit executed for {symbol} ({interval}) → {reason}")
 
-    # Residual cleanup safety
     with trades_lock:
         if key in trades:
             trades[key]["closed"] = True
@@ -183,7 +234,6 @@ def monitor_2bar_exit():
                 if elapsed < 2 * interval_sec:
                     continue
 
-                # Fetch live price
                 resp = requests.get(f"{BASE_URL}/fapi/v1/ticker/price?symbol={symbol}")
                 if resp.status_code != 200:
                     continue
@@ -195,7 +245,6 @@ def monitor_2bar_exit():
                 pnl_percent = ((current_price - entry_price) / entry_price) * 100 * LEVERAGE if side == "BUY" \
                     else ((entry_price - current_price) / entry_price) * 100 * LEVERAGE
 
-                # Trigger exit if loss persists after 2 bars
                 if pnl_percent < 0:
                     print(f"[2-Bar Exit] {symbol} {interval} → loss {pnl_percent:.2f}%. Exiting...")
 
@@ -229,7 +278,7 @@ threading.Thread(target=monitor_2bar_exit, daemon=True).start()
 def send_daily_summary():
     """Sends daily Telegram summary of trades"""
     while True:
-        now = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=5.5)))  # IST
+        now = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=5.5)))
         next_run = now.replace(hour=0, minute=0, second=0, microsecond=0) + datetime.timedelta(days=1)
         time.sleep((next_run - now).total_seconds())
 
