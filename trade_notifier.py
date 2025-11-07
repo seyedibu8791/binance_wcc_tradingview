@@ -1,5 +1,5 @@
 # ==============================
-# trade_notifier.py (FINAL MINIMAL MODE)
+# trade_notifier.py (FINAL FIXED)
 # ==============================
 
 import threading
@@ -35,7 +35,7 @@ def send_telegram_message(message: str):
 # ==============================
 # 🟩 LOG TRADE ENTRY
 # ==============================
-def log_trade_exit(symbol: str, order_id: str = None, filled_price: float = 0.0, reason="Normal Exit", interval: str = "1m"):
+def log_trade_entry(symbol: str, side: str, filled_price: float, order_id: str = None, interval: str = "1m"):
     """Store entry data + send Telegram alert"""
     key = f"{symbol}_{interval.lower()}"
 
@@ -72,13 +72,15 @@ Entry Price: <b>{filled_price}</b>
 # ==============================
 # 🟥 LOG TRADE EXIT
 # ==============================
-def log_trade_exit(symbol: str, filled_price: float, pnl: float, pnl_percent: float, reason="Exit", interval: str = "1m"):
+def log_trade_exit(symbol: str, filled_price: float, pnl: float = 0.0, pnl_percent: float = 0.0,
+                   reason: str = "Exit", interval: str = "1m", order_id: str = None):
     """Store exit + send Telegram alert"""
     key = f"{symbol}_{interval.lower()}"
 
     with trades_lock:
         trade = trades.get(key)
         if not trade or trade.get("closed"):
+            print(f"⚠️ log_trade_exit: no active trade found for {symbol}")
             return
         trade["exit_price"] = filled_price
         trade["pnl"] = pnl
@@ -95,8 +97,11 @@ Symbol: <b>#{symbol}</b>
 Interval: <b>{interval}</b>
 --- ⌁ ---
 Entry: {trade.get('entry_price', '?')}
-Exit: {filled_price}
-"""
+Exit: {filled_price}"""
+
+    if order_id:
+        msg += f"\nOrder ID: <b>{order_id}</b>"
+
     send_telegram_message(msg)
     print(f"[EXIT] {symbol} closed @ {filled_price} | PnL: {pnl}$ ({pnl_percent}%) | Reason: {reason}")
 
