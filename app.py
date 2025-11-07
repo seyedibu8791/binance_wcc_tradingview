@@ -385,14 +385,37 @@ def two_bar_force_exit_worker(symbol, interval_str):
 # ===============================
 def open_position(symbol, side, limit_price, interval="1m"):
     """
-    Places entry limit order only if there is no existing open position for that symbol.
-    Starts a wait_and_notify_filled_entry thread to confirm fill and mark the trade.
+    Places entry limit order.
+    If Binance reports an active position for symbol:
+      - Close that position first (market close)
+      - Wait for it to clear (polling for up to timeout)
+      - Then continue to place the new entry
     """
     # Check Binance for existing position
     pos_info = get_position_info(symbol)
     if pos_info and abs(float(pos_info.get("positionAmt", 0))) > 0:
-        print(f"🚫 Binance reports an active position for {symbol}. Ignoring entry signal.")
-        return {"status": "position_exists"}
+        # Instead of ignoring, close existing position and open replacement
+        existing_side = "BUY" if float(pos_info.get("positionAmt")) > 0 else "SELL"
+        print(f"⚠️ Existing Binance position detected for {symbol} (side={existing_side}). Closing it to replace with new entry.")
+
+        # Execute immediate market exit for existing position
+        execute_market_exit(symbol, existing_side, reason="Replace Entry - closing existing position")
+
+        # wait/poll until position clears (short timeout)
+        wait_start = time.time()
+        wait_timeout = 20  # seconds to wait for the previous position to clear; tweak if needed
+        cleared = False
+        while time.time() - wait_start < wait_timeout:
+            time.sleep(1)
+            cur = get_position_info(symbol)
+            if not cur or abs(float(cur.get("positionAmt", 0))) == 0:
+                cleared = True
+                break
+
+        if not cleared:
+            print(f"⚠️ Position for {symbol} did not clear within {wait_timeout}s. Will still attempt new entry, but risk of failure exists.")
+
+        # proceed to place new order (fallthrough)
 
     active_count = count_active_trades()
     if active_count >= MAX_ACTIVE_TRADES:
