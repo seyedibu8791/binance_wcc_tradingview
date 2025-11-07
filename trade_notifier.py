@@ -31,12 +31,11 @@ def send_telegram_message(message: str):
     except Exception as e:
         print(f"❌ Telegram exception: {e}")
 
-
 # ==============================
-# 🟩 LOG TRADE ENTRY
+# 🟩 LOG TRADE ENTRY (FILLED ONLY)
 # ==============================
 def log_trade_entry(symbol: str, side: str, filled_price: float, order_id: str = None, interval: str = "1m"):
-    """Store entry data + send Telegram alert"""
+    """Store entry data + send Telegram alert only when actual trade is filled on Binance"""
     key = f"{symbol}_{interval.lower()}"
 
     with trades_lock:
@@ -63,9 +62,10 @@ Trade Amount: {TRADE_AMOUNT}$
 --- ⌁ ---
 Entry Price: <b>{filled_price}</b>
 --- ⌁ ---
-🕐 Wait for Exit Signal.."""
+🕐 Trade Opened on Binance"""
     send_telegram_message(msg)
-    print(f"[ENTRY] {symbol} {side.upper()} @ {filled_price} ({interval})")
+    print(f"[ENTRY FILLED] {symbol} {side.upper()} @ {filled_price} ({interval})")
+
 
 
 # ==============================
