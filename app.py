@@ -246,14 +246,22 @@ async def evaluate_exit_signal(symbol, alert_close_price, alert_side, bar_high=N
         print(f"❌ evaluate_exit_signal error for {symbol}: {e}")
         return {"error": str(e)}
 
+
 # ===============================
-# Webhook
+# Webhook (Safe for Flask)
 # ===============================
 @app.route("/webhook", methods=["POST"])
 def webhook():
     data = request.get_data(as_text=True)
-    asyncio.create_task(handle_webhook(data))
+
+    # Run the async handler inside its own event loop, in a background thread
+    threading.Thread(
+        target=lambda: asyncio.run(handle_webhook(data)),
+        daemon=True
+    ).start()
+
     return jsonify({"status": "processing"})
+
 
 async def handle_webhook(data):
     try:
@@ -273,6 +281,7 @@ async def handle_webhook(data):
             trades[k] = trades.get(k, {})
             trades[k]["interval"] = interval
 
+        # --- Handle alerts based on comment type ---
         if comment == "BUY_ENTRY":
             await open_position(symbol, "BUY", close_price, interval=interval)
         elif comment == "SELL_ENTRY":
@@ -284,18 +293,21 @@ async def handle_webhook(data):
                 await execute_market_exit(symbol, side, reason=f"Signal: {comment}")
         elif comment in ["EXIT_LONG", "EXIT_SHORT", "SIGNAL_EXIT"]:
             await evaluate_exit_signal(symbol, close_price, comment, bar_high, bar_low, interval_hint=interval)
+
     except Exception as e:
         print("❌ handle_webhook error:", e)
 
+
 # ===============================
-# Ping & Self-Ping (Safe for Flask/Render)
+# Ping & Self-Ping
 # ===============================
 @app.route("/ping", methods=["GET"])
 def ping():
     return "pong", 200
 
+
 def self_ping():
-    """Periodically ping the app to prevent Render/Gunicorn sleep"""
+    """Keep-alive ping every 5 minutes (Render safe)"""
     url = os.getenv("SELF_PING_URL", "https://binance-wcc-tradingview.onrender.com/ping")
     while True:
         try:
@@ -304,7 +316,10 @@ def self_ping():
             print(f"[PING ERROR] {e}")
         time.sleep(300)  # every 5 minutes
 
+
+# Start the keep-alive thread
 threading.Thread(target=self_ping, daemon=True).start()
+
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 5000))
