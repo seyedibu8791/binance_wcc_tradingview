@@ -1,46 +1,44 @@
 # ==============================
-# trade_notifier.py (ASYNC / FINAL))
+# trade_notifier.py (FINAL SYNCED)
 # ==============================
 
-import asyncio
+import threading
 import time
-import aiohttp
+import requests
 from config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, TRADE_AMOUNT, LEVERAGE
 
 # ==============================
 # 🧾 SHARED STORAGE
 # ==============================
 trades = {}
-trades_lock = asyncio.Lock()
+trades_lock = threading.Lock()
 
 
 # ==============================
 # 📢 TELEGRAM HELPER
 # ==============================
-async def send_telegram_message(message: str):
-    """Send Telegram message via bot token asynchronously"""
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("⚠️ Missing Telegram credentials, skipping message.")
-        return
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"}
+def send_telegram_message(message: str):
+    """Send Telegram message via bot token"""
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(url, data=payload, timeout=10) as response:
-                if response.status != 200:
-                    print(f"⚠️ Telegram error: {await response.text()}")
+        if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+            print("⚠️ Missing Telegram credentials, skipping message.")
+            return
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"}
+        response = requests.post(url, data=payload, timeout=10)
+        if response.status_code != 200:
+            print(f"⚠️ Telegram error: {response.text}")
     except Exception as e:
         print(f"❌ Telegram exception: {e}")
-
 
 # ==============================
 # 🟩 LOG TRADE ENTRY (FILLED ONLY)
 # ==============================
-async def log_trade_entry(symbol: str, side: str, filled_price: float, order_id: str = None, interval: str = "1m"):
-    """Store entry data + send Telegram alert only when trade is filled on Binance"""
+def log_trade_entry(symbol: str, side: str, filled_price: float, order_id: str = None, interval: str = "1m"):
+    """Store entry data + send Telegram alert only when actual trade is filled on Binance"""
     key = f"{symbol}_{interval.lower()}"
 
-    async with trades_lock:
+    with trades_lock:
         trades[key] = {
             "symbol": symbol,
             "side": side.upper(),
@@ -65,14 +63,15 @@ Trade Amount: {TRADE_AMOUNT}$
 Entry Price: <b>{filled_price}</b>
 --- ⌁ ---
 🕐 Trade Opened on Binance"""
-    await send_telegram_message(msg)
+    send_telegram_message(msg)
     print(f"[ENTRY FILLED] {symbol} {side.upper()} @ {filled_price} ({interval})")
+
 
 
 # ==============================
 # 🟥 LOG TRADE EXIT
 # ==============================
-async def log_trade_exit(
+def log_trade_exit(
     symbol: str,
     filled_price: float,
     pnl: float = 0.0,
@@ -81,10 +80,10 @@ async def log_trade_exit(
     interval: str = "1m",
     order_id: str | None = None,
 ):
-    """Store exit + send Telegram alert asynchronously"""
+    """Store exit + send Telegram alert"""
     key = f"{symbol}_{interval.lower()}"
 
-    async with trades_lock:
+    with trades_lock:
         trade = trades.get(key)
         if not trade or trade.get("closed"):
             print(f"⚠️ log_trade_exit: no active trade found for {symbol}")
@@ -109,7 +108,7 @@ Exit: {filled_price}"""
     if order_id:
         msg += f"\nOrder ID: <b>{order_id}</b>"
 
-    await send_telegram_message(msg)
+    send_telegram_message(msg)
     print(f"[EXIT] {symbol} closed @ {filled_price} | PnL: {pnl}$ ({pnl_percent}%) | Reason: {reason}")
 
 
