@@ -1,5 +1,5 @@
 # ==============================
-# trade_notifier.py (ASYNC / FINAL)
+# trade_notifier.py (ASYNC / FINAL))
 # ==============================
 
 import asyncio
