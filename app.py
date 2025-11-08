@@ -276,45 +276,57 @@ async def evaluate_exit_signal(symbol, alert_close_price, alert_side, bar_high=N
         return {"error":str(e)}
 
 # ===============================
-# Webhook
+# Webhook (Thread-safe for Flask)
 # ===============================
-@app.route("/webhook",methods=["POST"])
+@app.route("/webhook", methods=["POST"])
 def webhook():
-    data=request.get_data(as_text=True)
-    asyncio.create_task(handle_webhook(data))
-    return jsonify({"status":"processing"})
+    data = request.get_data(as_text=True)
 
-async def handle_webhook(data):
+    # Run webhook handler in a background thread instead of asyncio
+    threading.Thread(target=handle_webhook, args=(data,)).start()
+
+    return jsonify({"status": "processing"})
+
+
+def handle_webhook(data):
+    """Handle incoming TradingView webhook alerts safely in a thread"""
     try:
-        parts=[p.strip() for p in data.split("|")]
-        if len(parts)>=6:
-            ticker,comment,close_price,bar_high,bar_low,interval=parts[:6]
+        parts = [p.strip() for p in data.split("|")]
+        if len(parts) >= 6:
+            ticker, comment, close_price, bar_high, bar_low, interval = parts[:6]
         else:
-            ticker,comment,close_price,interval=parts[0],parts[1],parts[2],parts[-1]
-            bar_high=bar_low=None
+            ticker, comment, close_price, interval = parts[0], parts[1], parts[2], parts[-1]
+            bar_high = bar_low = None
 
-        interval=normalize_interval(interval)
-        symbol=ticker.replace("USDT","")+"USDT"
-        close_price=float(close_price)
+        interval = normalize_interval(interval)
+        symbol = ticker.replace("USDT", "") + "USDT"
+        close_price = float(close_price)
 
-        async with trades_lock:
-            k=trade_key(symbol,interval)
-            trades[k]=trades.get(k,{})
-            trades[k]["interval"]=interval
+        with trades_lock:
+            k = trade_key(symbol, interval)
+            trades[k] = trades.get(k, {})
+            trades[k]["interval"] = interval
 
-        if comment=="BUY_ENTRY":
-            await open_position(symbol,"BUY",close_price,interval=interval)
-        elif comment=="SELL_ENTRY":
-            await open_position(symbol,"SELL",close_price,interval=interval)
-        elif comment in ["CROSS_EXIT_SHORT","CROSS_EXIT_LONG","OPPOSITE_EXIT","SAME_SIDE_EXIT"]:
-            pos = await get_position_info(symbol)
-            if pos and abs(float(pos.get("positionAmt",0)))>0:
-                side="BUY" if float(pos.get("positionAmt"))>0 else "SELL"
-                await execute_market_exit(symbol, side, reason=f"Signal: {comment}")
-        elif comment in ["EXIT_LONG","EXIT_SHORT","SIGNAL_EXIT"]:
-            await evaluate_exit_signal(symbol, close_price, comment, bar_high, bar_low, interval_hint=interval)
+        # ----- ENTRY SIGNALS -----
+        if comment == "BUY_ENTRY":
+            open_position(symbol, "BUY", close_price, interval=interval)
+        elif comment == "SELL_ENTRY":
+            open_position(symbol, "SELL", close_price, interval=interval)
+
+        # ----- CROSS/OPPOSITE/SAME-SIDE SIGNALS (force exit only) -----
+        elif comment in ["CROSS_EXIT_SHORT", "CROSS_EXIT_LONG", "OPPOSITE_EXIT", "SAME_SIDE_EXIT"]:
+            pos = get_position_info(symbol)
+            if pos and abs(float(pos.get("positionAmt", 0))) > 0:
+                side = "BUY" if float(pos.get("positionAmt")) > 0 else "SELL"
+                execute_market_exit(symbol, side, reason=f"Signal: {comment}")
+
+        # ----- EXIT SIGNALS (evaluate based on rules / 2-bar force) -----
+        elif comment in ["EXIT_LONG", "EXIT_SHORT", "SIGNAL_EXIT"]:
+            evaluate_exit_signal(symbol, close_price, comment, bar_high, bar_low, interval_hint=interval)
+
     except Exception as e:
         print("❌ handle_webhook error:", e)
+
 
 # ===============================
 # Ping & Self-Ping (Safe for Flask/Render)
@@ -325,7 +337,7 @@ def ping():
 
 
 def self_ping():
-    """Periodically ping the app to prevent Render/Gunicorn sleep"""
+    """Keep-alive pinger for Render"""
     import time
     import requests
     url = os.getenv("SELF_PING_URL", "https://binance-wcc-tradingview.onrender.com/ping")
@@ -338,11 +350,9 @@ def self_ping():
 
 
 # Start the self-ping in a background thread
-import threading
 threading.Thread(target=self_ping, daemon=True).start()
 
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
-
