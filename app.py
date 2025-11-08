@@ -317,23 +317,32 @@ async def handle_webhook(data):
         print("❌ handle_webhook error:", e)
 
 # ===============================
-# Ping & Self-Ping
+# Ping & Self-Ping (Safe for Flask/Render)
 # ===============================
-@app.route("/ping",methods=["GET"])
+@app.route("/ping", methods=["GET"])
 def ping():
-    return "pong",200
+    return "pong", 200
 
-async def self_ping():
+
+def self_ping():
+    """Periodically ping the app to prevent Render/Gunicorn sleep"""
+    import time
+    import requests
+    url = os.getenv("SELF_PING_URL", "https://binance-wcc-tradingview.onrender.com/ping")
     while True:
         try:
-            async with aiohttp.ClientSession() as session:
-                await session.get(os.getenv("SELF_PING_URL","https://binance-wcc-tradingview.onrender.com/ping"))
-        except:
-            pass
-        await asyncio.sleep(300)  # 5 min
+            requests.get(url, timeout=10)
+        except Exception as e:
+            print(f"[PING ERROR] {e}")
+        time.sleep(300)  # every 5 minutes
 
-asyncio.create_task(self_ping())
 
-if __name__=="__main__":
-    port=int(os.getenv("PORT",5000))
-    app.run(host="0.0.0.0",port=port)
+# Start the self-ping in a background thread
+import threading
+threading.Thread(target=self_ping, daemon=True).start()
+
+
+if __name__ == "__main__":
+    port = int(os.getenv("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
+
