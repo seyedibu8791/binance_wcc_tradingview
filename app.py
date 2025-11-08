@@ -2,9 +2,10 @@
 # app.py (Full Async Version - Unified Entry, Exit, 2-Bar, Evaluate Exit Signal)
 # ===============================
 
-import os, hmac, hashlib, time, asyncio
+import os, hmac, hashlib, time, asyncio, threading
 from flask import Flask, request, jsonify
 import aiohttp
+import requests
 from config import *
 from trade_notifier import (
     log_trade_entry,
@@ -119,12 +120,12 @@ async def get_position_info(symbol):
     return None
 
 def compute_implied_pnl_dollar(entry_price, exit_price, position_qty, side):
-    if position_qty==0:
+    if position_qty == 0:
         return 0.0
-    if side.upper()=="BUY":
-        return (exit_price-entry_price)*position_qty
+    if side.upper() == "BUY":
+        return (exit_price - entry_price) * position_qty
     else:
-        return (entry_price-exit_price)*position_qty
+        return (entry_price - exit_price) * position_qty
 
 # ===============================
 # Unified Exit & Finalize
@@ -141,7 +142,8 @@ async def finalize_trade(symbol, reason):
 
         async with trades_lock:
             keys_to_remove = [k for k in trades.keys() if k.startswith(f"{symbol}_")]
-            for k in keys_to_remove: trades.pop(k,None)
+            for k in keys_to_remove:
+                trades.pop(k,None)
 
         timestamp = int(time.time() * 1000)
         query_string = f"symbol={symbol}&timestamp={timestamp}"
@@ -159,12 +161,12 @@ async def finalize_trade(symbol, reason):
             print(f"⚠️ No recent trade data for {symbol}")
             return
         last_trade = trade_data[-1]
-        filled_price = float(last_trade.get("price",0.0))
-        realized_pnl = float(last_trade.get("realizedPnl",0.0))
-        qty = float(last_trade.get("qty",0.0))
+        filled_price = float(last_trade.get("price", 0.0))
+        realized_pnl = float(last_trade.get("realizedPnl", 0.0))
+        qty = float(last_trade.get("qty", 0.0))
 
-        pnl = round(realized_pnl,2)
-        pnl_percent = round((realized_pnl/(qty*filled_price)*100),2) if qty>0 and filled_price>0 else 0.0
+        pnl = round(realized_pnl, 2)
+        pnl_percent = round((realized_pnl / (qty * filled_price) * 100), 2) if qty > 0 and filled_price > 0 else 0.0
 
         log_trade_exit(symbol, filled_price, pnl, pnl_percent, reason=reason, interval=interval, order_id=last_trade.get("orderId"))
         print(f"[EXIT] {symbol} closed | {reason} | Exit: {filled_price} | PnL: {pnl} ({pnl_percent}%)")
@@ -173,25 +175,25 @@ async def finalize_trade(symbol, reason):
 
 async def execute_market_exit(symbol, side, reason="Market Exit"):
     pos_data = await get_position_info(symbol)
-    if not pos_data or abs(float(pos_data.get("positionAmt",0)))==0:
+    if not pos_data or abs(float(pos_data.get("positionAmt", 0))) == 0:
         print(f"⚠️ No active position for {symbol}")
         async with trades_lock:
             keys_to_remove = [k for k in trades.keys() if k.startswith(f"{symbol}_")]
             for k in keys_to_remove:
-                trades.pop(k,None)
-        return {"status":"no_position"}
+                trades.pop(k, None)
+        return {"status": "no_position"}
 
-    qty = abs(float(pos_data.get("positionAmt",0)))
+    qty = abs(float(pos_data.get("positionAmt", 0)))
     qty = round_quantity(symbol, qty)
-    close_side = "SELL" if side.upper()=="BUY" else "BUY"
-    response = await binance_signed_request("POST","/fapi/v1/order",{"symbol":symbol,"side":close_side,"type":"MARKET","quantity":qty})
-    asyncio.create_task(wait_and_finalize_exit(symbol,response.get("orderId"),reason))
+    close_side = "SELL" if side.upper() == "BUY" else "BUY"
+    response = await binance_signed_request("POST", "/fapi/v1/order", {"symbol": symbol, "side": close_side, "type": "MARKET", "quantity": qty})
+    asyncio.create_task(wait_and_finalize_exit(symbol, response.get("orderId"), reason))
     return response
 
 async def wait_and_finalize_exit(symbol, order_id, reason):
     while True:
-        order_status = await binance_signed_request("GET","/fapi/v1/order",{"symbol":symbol,"orderId":order_id})
-        if isinstance(order_status, dict) and order_status.get("status")=="FILLED":
+        order_status = await binance_signed_request("GET", "/fapi/v1/order", {"symbol": symbol, "orderId": order_id})
+        if isinstance(order_status, dict) and order_status.get("status") == "FILLED":
             await finalize_trade(symbol, reason)
             break
         await asyncio.sleep(1)
@@ -207,73 +209,42 @@ async def two_bar_force_exit_worker(symbol, interval_str):
             return
         entry_time = trade.get("entry_time", time.time())
 
-    remaining = (entry_time + 2*interval_seconds) - time.time()
-    if remaining>0:
+    remaining = (entry_time + 2 * interval_seconds) - time.time()
+    if remaining > 0:
         await asyncio.sleep(remaining)
 
     pos = await get_position_info(symbol)
-    if not pos or abs(float(pos.get("positionAmt",0)))==0:
+    if not pos or abs(float(pos.get("positionAmt", 0))) == 0:
         async with trades_lock:
             keys_to_remove = [k for k in trades.keys() if k.startswith(f"{symbol}_")]
             for k in keys_to_remove:
-                trades.pop(k,None)
+                trades.pop(k, None)
         return
 
-    side = "BUY" if float(pos.get("positionAmt"))>0 else "SELL"
+    side = "BUY" if float(pos.get("positionAmt")) > 0 else "SELL"
     print(f"[2-BAR FORCE] {symbol} → forcing market exit after 2 bars.")
     await execute_market_exit(symbol, side, reason="2-Bar Force Exit")
 
 # ===============================
-# Evaluate Exit Signal (Async)
+# Evaluate Exit Signal (Simplified Immediate Close)
 # ===============================
 async def evaluate_exit_signal(symbol, alert_close_price, alert_side, bar_high=None, bar_low=None, interval_hint="1m"):
     try:
         pos = await get_position_info(symbol)
-        if not pos or abs(float(pos.get("positionAmt",0)))==0:
+        if not pos or abs(float(pos.get("positionAmt", 0))) == 0:
             print(f"⚠️ evaluate_exit_signal: no active position for {symbol}")
             async with trades_lock:
-                keys_to_remove=[k for k in trades.keys() if k.startswith(f"{symbol}_")]
-                for k in keys_to_remove: trades.pop(k,None)
-            return {"status":"no_position"}
+                keys_to_remove = [k for k in trades.keys() if k.startswith(f"{symbol}_")]
+                for k in keys_to_remove: trades.pop(k, None)
+            return {"status": "no_position"}
 
-        position_amt=abs(float(pos.get("positionAmt",0)))
-        side="BUY" if float(pos.get("positionAmt"))>0 else "SELL"
-
-        interval=interval_hint
-        async with trades_lock:
-            for k in trades.keys():
-                if k.startswith(f"{symbol}_"):
-                    interval=k.split("_",1)[1]
-                    break
-            trade=trades.get(trade_key(symbol,interval),{})
-            entry_price=trade.get("entry_price",float(pos.get("entryPrice",0.0)))
-            entry_time=trade.get("entry_time",time.time())
-            entry_filled=trade.get("entry_filled",False)
-
-        alert_close_price=float(alert_close_price)
-        implied_pnl_from_alert=compute_implied_pnl_dollar(entry_price,alert_close_price,position_amt,side)
-
-        interval_seconds=interval_to_seconds(interval)
-        two_bar_end=entry_time+(2*interval_seconds)
-        now=time.time()
-
-        print(f"[EXIT EVAL] {symbol} | now={now}, two_bar_end={two_bar_end} | current_unrealized={float(pos.get('unRealizedProfit',0.0)):.4f} | alert_implied={implied_pnl_from_alert:.4f}")
-
-        if now<two_bar_end:
-            if implied_pnl_from_alert<float(pos.get("unRealizedProfit",0.0)):
-                print(f"[EXIT EVAL] {symbol} → alert_implied_pnl worse → closing now")
-                await execute_market_exit(symbol, side, reason="Exit Signal (early close)")
-                return {"status":"closed_early_market"}
-            else:
-                print(f"[EXIT EVAL] {symbol} → alert_implied_pnl not worse. Waiting 2-bar end")
-                return {"status":"wait_2bar"}
-        else:
-            print(f"[EXIT EVAL] {symbol} → after 2-bar end → closing now")
-            await execute_market_exit(symbol, side, reason="Exit Signal (post 2-bar)")
-            return {"status":"closed_post_2bar_market"}
+        side = "BUY" if float(pos.get("positionAmt")) > 0 else "SELL"
+        print(f"[EXIT EVAL] {symbol} → Exit alert received → closing immediately.")
+        await execute_market_exit(symbol, side, reason="Exit Signal (immediate close)")
+        return {"status": "closed_immediate_market"}
     except Exception as e:
         print(f"❌ evaluate_exit_signal error for {symbol}: {e}")
-        return {"error":str(e)}
+        return {"error": str(e)}
 
 # ===============================
 # Webhook
@@ -283,7 +254,6 @@ def webhook():
     data = request.get_data(as_text=True)
     asyncio.create_task(handle_webhook(data))
     return jsonify({"status": "processing"})
-
 
 async def handle_webhook(data):
     try:
@@ -317,7 +287,6 @@ async def handle_webhook(data):
     except Exception as e:
         print("❌ handle_webhook error:", e)
 
-
 # ===============================
 # Ping & Self-Ping (Safe for Flask/Render)
 # ===============================
@@ -325,11 +294,8 @@ async def handle_webhook(data):
 def ping():
     return "pong", 200
 
-
 def self_ping():
     """Periodically ping the app to prevent Render/Gunicorn sleep"""
-    import time
-    import requests
     url = os.getenv("SELF_PING_URL", "https://binance-wcc-tradingview.onrender.com/ping")
     while True:
         try:
@@ -338,16 +304,7 @@ def self_ping():
             print(f"[PING ERROR] {e}")
         time.sleep(300)  # every 5 minutes
 
-
-# ✅ Import threading before using it
-import threading
 threading.Thread(target=self_ping, daemon=True).start()
-
-
-if __name__ == "__main__":
-    port = int(os.getenv("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
-
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 5000))
