@@ -167,19 +167,26 @@ def compute_implied_pnl_dollar(entry_price, exit_price, position_qty, side):
 def finalize_trade(symbol, reason):
     """
     Fetch actual trade data from Binance (userTrades) and send unified Telegram exit
-    with accurate entry price, even if local trades dict was lost or mismatched.
+    using trade_notifier.log_trade_exit(...) signature:
+        log_trade_exit(symbol, filled_price, pnl, pnl_percent, reason, interval, order_id)
+    This function will:
+      - fetch userTrades
+      - derive pnl and pnl%
+      - call log_trade_exit(...) which relies on local trades dict to include entry_price if present
+      - cleanup any local trade keys for symbol
     """
     try:
-        # Find stored interval (default 1m)
+        # determine interval from local state if any
         found_interval = "1m"
         with trades_lock:
             for k in list(trades.keys()):
                 if k.startswith(f"{symbol}_"):
                     found_interval = k.split("_", 1)[1]
                     break
+
         interval = found_interval
 
-        # Binance userTrades fetch
+        # Signed request to userTrades
         timestamp = int(time.time() * 1000)
         query_string = f"symbol={symbol}&timestamp={timestamp}"
         signature = hmac.new(BINANCE_SECRET_KEY.encode(), query_string.encode(), hashlib.sha256).hexdigest()
@@ -201,39 +208,39 @@ def finalize_trade(symbol, reason):
         realized_pnl = float(last_trade.get("realizedPnl", 0.0))
         qty = float(last_trade.get("qty", 0.0))
 
-        # ---- 🔍 Find matching local entry
-        trade_key = f"{symbol}_{interval.lower()}"
-        entry_price = filled_price
-        order_id = last_trade.get("orderId") or f"auto_{int(time.time())}"
-
+        # try to get local entry price to compute percent and to include in exit message
         with trades_lock:
-            local_trade = trades.get(trade_key)
-            if local_trade:
-                entry_price = local_trade.get("entry_price", entry_price)
-                order_id = local_trade.get("order_id", order_id)
-
-        # ---- 🔁 Binance fallback if local missing
-        if not local_trade or entry_price == filled_price:
-            for tr in reversed(trade_data):
-                if tr["side"] != last_trade["side"]:  # opposite side → entry
-                    entry_price = float(tr["price"])
-                    break
+            local_trade = trades.get(trade_key(symbol, interval), {}) or trades.get(symbol, {}) or {}
+            entry_price = local_trade.get("entry_price", filled_price)
+            order_id = local_trade.get("order_id", last_trade.get("orderId") or f"auto_{int(time.time())}")
 
         pnl = round(realized_pnl, 2)
         pnl_percent = 0.0
-        if qty > 0 and entry_price > 0:
-            pnl_percent = round((realized_pnl / (qty * entry_price)) * 100, 2)
+        try:
+            if qty > 0 and entry_price > 0:
+                raw_pct = ((filled_price - entry_price) / entry_price) * 100
+                # Detect direction correctly
+                side = local_trade.get("side", last_trade.get("side", "BUY")).upper()
+                if side == "SELL":
+                    raw_pct = -raw_pct
+                pnl_percent = round(raw_pct * LEVERAGE, 2)
+        except Exception:
+            pnl_percent = 0.0
 
+        # call trade_notifier's log_trade_exit with the expected signature
+        # log_trade_exit(symbol, filled_price, pnl, pnl_percent, reason=..., interval=..., order_id=...)
         log_trade_exit(symbol, filled_price, pnl, pnl_percent, reason=reason, interval=interval, order_id=order_id)
 
-        print(f"[EXIT] {symbol} | {reason} | Entry: {entry_price} | Exit: {filled_price} | PnL: {pnl} ({pnl_percent}%)")
+        print(f"[EXIT] {symbol} closed | {reason} | Exit: {filled_price} | PnL: {pnl} ({pnl_percent}%)")
 
+        # cleanup local state entries that match symbol
         with trades_lock:
-            trades.pop(trade_key, None)
+            keys_to_remove = [k for k in trades.keys() if k.startswith(f"{symbol}_")]
+            for k in keys_to_remove:
+                trades.pop(k, None)
 
     except Exception as e:
         print(f"❌ finalize_trade() error for {symbol}: {e}")
-
 
 
 # ===============================
