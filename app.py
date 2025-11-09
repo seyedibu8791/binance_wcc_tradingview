@@ -359,12 +359,16 @@ def wait_and_finalize_exit(symbol, order_id, reason):
 def two_bar_force_exit_worker(symbol, interval_str):
     """
     Worker that waits for 2 bars (2 * interval_seconds) after entry_filled,
-    then force-closes at market (regardless of PnL) unless already closed or an exit signal arrived.
+    then conditionally force-closes at market:
+      - If unrealized PnL is negative -> force market exit (2-bar forced)
+      - If unrealized PnL is >= 0 -> keep position open (do nothing)
+    The worker will skip forcing if an exit signal arrived and set the local flag 'exit_signal_received'.
     """
     try:
         interval_seconds = interval_to_seconds(interval_str)
         key = trade_key(symbol, interval_str)
 
+        # Capture the entry_time at start (in case entry_time later changed)
         with trades_lock:
             trade = trades.get(key) or trades.get(symbol)
             if not trade:
@@ -378,16 +382,18 @@ def two_bar_force_exit_worker(symbol, interval_str):
         if remaining > 0:
             time.sleep(remaining)
 
-        # Re-check: if exit_signal_received was set, skip 2-bar force close
+        # Re-check local trade: if exit_signal_received is set, skip 2-bar logic
         with trades_lock:
             trade = trades.get(key) or trades.get(symbol)
             if not trade:
                 return
             if trade.get("exit_signal_received"):
-                print(f"[2-BAR] {symbol} → exit signal already processed, skipping 2-bar force.")
+                print(f"[2-BAR] {symbol} → exit signal already received; skipping 2-bar check.")
                 return
+            # also ensure still open and filled
+            entry_filled = trade.get("entry_filled", False)
 
-        # Before forcing exit, check if trade still exists and open
+        # Check actual Binance position
         pos = get_position_info(symbol)
         if not pos or abs(float(pos.get("positionAmt", 0))) == 0:
             # Nothing to close; cleanup local state
@@ -397,11 +403,28 @@ def two_bar_force_exit_worker(symbol, interval_str):
                     trades.pop(k, None)
             return
 
-        # Force market exit after 2 bars regardless of PnL
-        side = "BUY" if float(pos.get("positionAmt")) > 0 else "SELL"
-        print(f"[2-BAR FORCE] {symbol} → forcing market exit after 2 bars.")
-        # mark reason specifically
-        execute_market_exit(symbol, side, reason="2-Bar Force Exit")
+        # If entry not filled yet locally, do not force
+        if not entry_filled:
+            print(f"[2-BAR] {symbol} → entry not marked filled locally; skipping 2-bar force.")
+            return
+
+        # Determine unrealized PnL from Binance position (in dollars)
+        try:
+            unrealized = float(pos.get("unRealizedProfit", 0.0))
+        except Exception:
+            unrealized = 0.0
+
+        print(f"[2-BAR EVAL] {symbol} → unrealized_profit={unrealized}")
+
+        # If unrealized < 0 => force market exit. else keep position open.
+        if unrealized < 0:
+            side = "BUY" if float(pos.get("positionAmt")) > 0 else "SELL"
+            print(f"[2-BAR FORCE] {symbol} → negative unrealized ({unrealized}) after 2 bars → forcing market exit.")
+            # mark a reason and call market exit
+            execute_market_exit(symbol, side, reason="2-Bar Force Exit")
+        else:
+            # Positive or zero unrealized -> do not force exit; keep position active
+            print(f"[2-BAR HOLD] {symbol} → unrealized >= 0 ({unrealized}). Keeping position open; awaiting exit signals.")
 
     except Exception as e:
         print(f"❌ two_bar_force_exit_worker error for {symbol}: {e}")
