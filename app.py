@@ -218,7 +218,12 @@ def finalize_trade(symbol, reason):
         pnl_percent = 0.0
         try:
             if qty > 0 and entry_price > 0:
-                pnl_percent = round((realized_pnl / (qty * entry_price)) * 100, 2)
+                raw_pct = ((filled_price - entry_price) / entry_price) * 100
+                # Detect direction correctly
+                side = local_trade.get("side", last_trade.get("side", "BUY")).upper()
+                if side == "SELL":
+                    raw_pct = -raw_pct
+                pnl_percent = round(raw_pct * LEVERAGE, 2)
         except Exception:
             pnl_percent = 0.0
 
