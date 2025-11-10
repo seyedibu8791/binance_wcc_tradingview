@@ -1,5 +1,5 @@
 # ===============================
-# app.py (final)
+# app.py (final) - UPDATED PATCHED VERSION
 # ===============================
 
 from flask import Flask, request, jsonify
@@ -214,21 +214,17 @@ def finalize_trade(symbol, reason):
             entry_price = local_trade.get("entry_price", filled_price)
             order_id = local_trade.get("order_id", last_trade.get("orderId") or f"auto_{int(time.time())}")
 
+        # Compute PnL absolute and percent consistently using realized_pnl and qty
         pnl = round(realized_pnl, 2)
         pnl_percent = 0.0
         try:
             if qty > 0 and entry_price > 0:
-                raw_pct = ((filled_price - entry_price) / entry_price) * 100
-                # Detect direction correctly
-                side = local_trade.get("side", last_trade.get("side", "BUY")).upper()
-                if side == "SELL":
-                    raw_pct = -raw_pct
-                pnl_percent = round(raw_pct * LEVERAGE, 2)
+                # percent based on realized pnl / notional invested = realized_pnl / (qty * entry_price)
+                pnl_percent = round((realized_pnl / (qty * entry_price)) * 100, 2)
         except Exception:
             pnl_percent = 0.0
 
-        # call trade_notifier's log_trade_exit with the expected signature
-        # log_trade_exit(symbol, filled_price, pnl, pnl_percent, reason=..., interval=..., order_id=...)
+        # call trade_notifier's log_trade_exit()
         log_trade_exit(symbol, filled_price, pnl, pnl_percent, reason=reason, interval=interval, order_id=order_id)
 
         print(f"[EXIT] {symbol} closed | {reason} | Exit: {filled_price} | PnL: {pnl} ({pnl_percent}%)")
@@ -545,6 +541,26 @@ def wait_and_notify_filled_entry(symbol, side, order_id, interval="1m"):
                     trade["entry_time"] = time.time()
                     trade["order_id"] = order_id
                     trade["position_qty"] = executed_qty  # store base asset qty
+
+                    # ======= PATCH: ensure fallback key without interval exists =======
+                    # Some workers check trades.get(symbol) (no interval). Create/update that fallback
+                    # to avoid race/key-mismatch issues where the 2-bar worker can't find the filled entry.
+                    fallback_key = symbol  # plain symbol fallback
+                    trades[fallback_key] = trades.get(fallback_key, {})
+                    # copy important fields across (shallow copy is fine)
+                    trades[fallback_key].update({
+                        "symbol": trade.get("symbol"),
+                        "side": trade.get("side"),
+                        "entry_price": trade.get("entry_price"),
+                        "entry_time": trade.get("entry_time"),
+                        "entry_filled": trade.get("entry_filled"),
+                        "order_id": trade.get("order_id"),
+                        "position_qty": trade.get("position_qty"),
+                        "interval": trade.get("interval"),
+                        "closed": trade.get("closed", False),
+                    })
+                # ==================================================================
+
                 # Send single entry notification (actual Binance price)
                 log_trade_entry(symbol, side, avg_price, order_id=order_id, interval=interval)
                 print(f"[ENTRY FILLED] {symbol} {side} @ {avg_price} ({interval})")
@@ -605,7 +621,7 @@ def evaluate_exit_signal(symbol, alert_close_price, alert_side, bar_high=None, b
             else:
                 # also mark any matching symbol key without interval
                 for k in list(trades.keys()):
-                    if k.startswith(f"{symbol}_"):
+                    if k.startswith(f"{symbol}_") or k == symbol:
                         trades[k]["exit_signal_received"] = True
 
         # attempt exit (limit -> market)
@@ -663,7 +679,7 @@ def webhook():
                 # mark exit_signal_received for local trade if present
                 with trades_lock:
                     for k in list(trades.keys()):
-                        if k.startswith(f"{symbol}_"):
+                        if k.startswith(f"{symbol}_") or k == symbol:
                             trades[k]["exit_signal_received"] = True
                 # attempt limit->market if provided
                 if USE_BAR_HIGH_LOW_FOR_EXIT and bar_high and bar_low:
@@ -677,6 +693,9 @@ def webhook():
                     keys_to_remove = [k for k in trades.keys() if k.startswith(f"{symbol}_")]
                     for k in keys_to_remove:
                         trades.pop(k, None)
+                    # also remove fallback symbol key if present
+                    if symbol in trades:
+                        trades.pop(symbol, None)
                 return jsonify({"status": "no_position"})
 
         # EXIT signals (informational; but now they always close immediately)
