@@ -162,6 +162,20 @@ def compute_implied_pnl_dollar(entry_price, exit_price, position_qty, side):
 
 
 # ===============================
+# 🧹 RESET 2-BAR STATE HELPER
+# ===============================
+def reset_2bar_state(symbol: str):
+    """Reset 2-bar and unrealized loss tracking for a given symbol (clears fallback keys too)."""
+    with trades_lock:
+        # remove keyed entries that belong to symbol (both interval keys and plain symbol fallback)
+        keys_to_remove = [k for k in list(trades.keys()) if k.startswith(f"{symbol}_") or k == symbol]
+        for k in keys_to_remove:
+            # keep other fields only if you intentionally want to preserve — here we remove entire key
+            trades.pop(k, None)
+        print(f"[RESET] Cleared 2-bar and local state for {symbol}")
+
+
+# ===============================
 # 🧠 Unified Exit Finalizer (Patched)
 # ===============================
 def finalize_trade(symbol, reason):
@@ -174,6 +188,7 @@ def finalize_trade(symbol, reason):
       - derive pnl and pnl%
       - call log_trade_exit(...) which relies on local trades dict to include entry_price if present
       - cleanup any local trade keys for symbol
+      - call reset_2bar_state to remove all local 2-bar tracking and fallback keys
     """
     try:
         # determine interval from local state if any
@@ -196,11 +211,14 @@ def finalize_trade(symbol, reason):
         resp = requests.get(url, headers=headers)
         if resp.status_code != 200:
             print(f"⚠️ Binance trade fetch failed for {symbol}: {resp.text}")
+            # still attempt cleanup of local keys to avoid stale state
+            reset_2bar_state(symbol)
             return
 
         trade_data = resp.json()
         if not trade_data:
             print(f"⚠️ No recent trade data for {symbol}")
+            reset_2bar_state(symbol)
             return
 
         last_trade = trade_data[-1]
@@ -229,14 +247,13 @@ def finalize_trade(symbol, reason):
 
         print(f"[EXIT] {symbol} closed | {reason} | Exit: {filled_price} | PnL: {pnl} ({pnl_percent}%)")
 
-        # cleanup local state entries that match symbol
-        with trades_lock:
-            keys_to_remove = [k for k in trades.keys() if k.startswith(f"{symbol}_")]
-            for k in keys_to_remove:
-                trades.pop(k, None)
+        # cleanup local state entries that match symbol (both interval keys and fallback)
+        reset_2bar_state(symbol)
 
     except Exception as e:
         print(f"❌ finalize_trade() error for {symbol}: {e}")
+        # best-effort cleanup on exception
+        reset_2bar_state(symbol)
 
 
 # ===============================
@@ -317,10 +334,7 @@ def execute_market_exit(symbol, side, reason="Market Exit"):
     if not pos_data or abs(float(pos_data[0].get("positionAmt", 0))) == 0:
         print(f"⚠️ No active position for {symbol}")
         # Clear local state if mismatch
-        with trades_lock:
-            keys_to_remove = [k for k in trades.keys() if k.startswith(f"{symbol}_")]
-            for k in keys_to_remove:
-                trades.pop(k, None)
+        reset_2bar_state(symbol)
         return {"status": "no_position"}
 
     qty = abs(float(pos_data[0].get("positionAmt", 0)))
@@ -354,8 +368,8 @@ def wait_and_finalize_exit(symbol, order_id, reason):
 # ===============================
 def two_bar_force_exit_worker(symbol, interval_str):
     """
-    Worker that waits for 2 bars (2 * interval_seconds) after entry_filled,
-    then conditionally force-closes at market:
+    Worker that waits for 2 bars (2 * interval_seconds) after the TradingView entry alert
+    (bar_start_time), then conditionally force-closes at market:
       - If unrealized PnL is negative -> force market exit (2-bar forced)
       - If unrealized PnL is >= 0 -> keep position open (do nothing)
     The worker will skip forcing if an exit signal arrived and set the local flag 'exit_signal_received'.
@@ -364,15 +378,18 @@ def two_bar_force_exit_worker(symbol, interval_str):
         interval_seconds = interval_to_seconds(interval_str)
         key = trade_key(symbol, interval_str)
 
-        # Capture the entry_time at start (in case entry_time later changed)
+        # Use bar_start_time (set at entry alert) if available; fall back to entry_time (fill)
         with trades_lock:
             trade = trades.get(key) or trades.get(symbol)
             if not trade:
                 return
+            bar_start_time = trade.get("bar_start_time")
             entry_time = trade.get("entry_time", time.time())
 
-        # Sleep until 2 bars after entry_time
-        target = entry_time + (2 * interval_seconds)
+        start_time = bar_start_time or entry_time or time.time()
+
+        # Sleep until 2 bars after the bar_start_time (or entry_time fallback)
+        target = start_time + (2 * interval_seconds)
         now = time.time()
         remaining = target - now
         if remaining > 0:
@@ -386,24 +403,19 @@ def two_bar_force_exit_worker(symbol, interval_str):
             if trade.get("exit_signal_received"):
                 print(f"[2-BAR] {symbol} → exit signal already received; skipping 2-bar check.")
                 return
-            # also ensure still open and filled
+            # ensure still open and check flag entry_alert_received / entry_filled
+            entry_alert_received = trade.get("entry_alert_received", False)
+            # not forcing if no alert was recorded (shouldn't happen if worker started properly)
             entry_filled = trade.get("entry_filled", False)
 
         # Check actual Binance position
         pos = get_position_info(symbol)
         if not pos or abs(float(pos.get("positionAmt", 0))) == 0:
             # Nothing to close; cleanup local state
-            with trades_lock:
-                keys_to_remove = [k for k in trades.keys() if k.startswith(f"{symbol}_")]
-                for k in keys_to_remove:
-                    trades.pop(k, None)
+            reset_2bar_state(symbol)
             return
 
-        # If entry not filled yet locally, do not force
-        if not entry_filled:
-            print(f"[2-BAR] {symbol} → entry not marked filled locally; skipping 2-bar force.")
-            return
-
+        # If we have no record of the alert or entry, still evaluate based on bar_start_time fallback
         # Determine unrealized PnL from Binance position (in dollars)
         try:
             unrealized = float(pos.get("unRealizedProfit", 0.0))
@@ -416,7 +428,7 @@ def two_bar_force_exit_worker(symbol, interval_str):
         if unrealized < 0:
             side = "BUY" if float(pos.get("positionAmt")) > 0 else "SELL"
             print(f"[2-BAR FORCE] {symbol} → negative unrealized ({unrealized}) after 2 bars → forcing market exit.")
-            # mark a reason and call market exit
+            # call market exit (finalize_trade will cleanup)
             execute_market_exit(symbol, side, reason="2-Bar Force Exit")
         else:
             # Positive or zero unrealized -> do not force exit; keep position active
@@ -458,7 +470,7 @@ def open_position(symbol, side, limit_price, interval="1m"):
             cur = get_position_info(symbol)
             # check local trades cleared as well
             with trades_lock:
-                any_local = any(k.startswith(f"{symbol}_") for k in trades.keys())
+                any_local = any(k.startswith(f"{symbol}_") or k == symbol for k in trades.keys())
             if (not cur or abs(float(cur.get("positionAmt", 0))) == 0) and not any_local:
                 cleared = True
                 break
@@ -488,6 +500,8 @@ def open_position(symbol, side, limit_price, interval="1m"):
             "closed": False,
             "two_bar_thread_started": False,
             "exit_signal_received": False,  # flag to avoid 2-bar forcing if exit came earlier
+            "entry_alert_received": trades.get(key, {}).get("entry_alert_received", False),
+            "bar_start_time": trades.get(key, {}).get("bar_start_time", None),
         }
 
     # Place the limit order (do NOT send pending entry telegram; entry telegram will be sent when filled)
@@ -558,6 +572,8 @@ def wait_and_notify_filled_entry(symbol, side, order_id, interval="1m"):
                         "position_qty": trade.get("position_qty"),
                         "interval": trade.get("interval"),
                         "closed": trade.get("closed", False),
+                        "entry_alert_received": trades.get(key, {}).get("entry_alert_received", False),
+                        "bar_start_time": trades.get(key, {}).get("bar_start_time"),
                     })
                 # ==================================================================
 
@@ -598,10 +614,7 @@ def evaluate_exit_signal(symbol, alert_close_price, alert_side, bar_high=None, b
         if not pos or abs(float(pos.get("positionAmt", 0))) == 0:
             print(f"⚠️ evaluate_exit_signal: no active position for {symbol}. Ignoring exit alert.")
             # cleanup local state
-            with trades_lock:
-                keys_to_remove = [k for k in trades.keys() if k.startswith(f"{symbol}_")]
-                for k in keys_to_remove:
-                    trades.pop(k, None)
+            reset_2bar_state(symbol)
             return {"status": "no_position"}
 
         # determine side
@@ -664,10 +677,26 @@ def webhook():
             trades[k]["interval"] = interval
 
         # ENTRY signals
-        if comment == "BUY_ENTRY":
-            return jsonify(open_position(symbol, "BUY", close_price, interval=interval))
-        elif comment == "SELL_ENTRY":
-            return jsonify(open_position(symbol, "SELL", close_price, interval=interval))
+        if comment == "BUY_ENTRY" or comment == "SELL_ENTRY":
+            # Record entry alert time and start the 2-bar counter from the alert time
+            with trades_lock:
+                k = trade_key(symbol, interval)
+                trades.setdefault(k, {})
+                trades[k]["entry_alert_received"] = True
+                trades[k]["bar_start_time"] = time.time()
+                # also ensure fallback symbol key exists (keeps parity for workers)
+                trades.setdefault(symbol, {})
+                trades[symbol].update({
+                    "entry_alert_received": True,
+                    "bar_start_time": trades[k]["bar_start_time"],
+                    "interval": interval
+                })
+
+            # call open_position
+            if comment == "BUY_ENTRY":
+                return jsonify(open_position(symbol, "BUY", close_price, interval=interval))
+            else:
+                return jsonify(open_position(symbol, "SELL", close_price, interval=interval))
 
         # CROSS / OPPOSITE / SAME-SIDE signals => immediate close regardless of PnL
         elif comment in ["CROSS_EXIT_SHORT", "CROSS_EXIT_LONG", "OPPOSITE_EXIT", "SAME_SIDE_EXIT"]:
@@ -676,7 +705,7 @@ def webhook():
                 side = "BUY" if float(pos.get("positionAmt")) > 0 else "SELL"
                 # Map reason label
                 reason_label = "Cross Exit" if comment.startswith("CROSS") else ("Opposite Exit" if comment == "OPPOSITE_EXIT" else "Same Side Exit")
-                # mark exit_signal_received for local trade if present
+                # mark exit_signal_received for local trade if present and clear 2-bar tracking
                 with trades_lock:
                     for k in list(trades.keys()):
                         if k.startswith(f"{symbol}_") or k == symbol:
@@ -686,21 +715,24 @@ def webhook():
                     execute_exit(symbol, side, interval=interval, bar_high=bar_high, bar_low=bar_low, reason=reason_label)
                 else:
                     execute_market_exit(symbol, side, reason=reason_label)
+                # cleanup local 2-bar tracking (finalize_trade will also clean, but be explicit)
+                reset_2bar_state(symbol)
                 return jsonify({"status": "closed_by_opposite_same_cross"})
             else:
                 # no position — ensure local state cleared
-                with trades_lock:
-                    keys_to_remove = [k for k in trades.keys() if k.startswith(f"{symbol}_")]
-                    for k in keys_to_remove:
-                        trades.pop(k, None)
-                    # also remove fallback symbol key if present
-                    if symbol in trades:
-                        trades.pop(symbol, None)
+                reset_2bar_state(symbol)
                 return jsonify({"status": "no_position"})
 
         # EXIT signals (informational; but now they always close immediately)
         elif comment in ["EXIT_LONG", "EXIT_SHORT", "SIGNAL_EXIT"]:
             result = evaluate_exit_signal(symbol, close_price, comment, bar_high, bar_low, interval_hint=interval)
+            # after evaluating exit signal, reset 2-bar state (finalize_trade will also clear after real exit)
+            # but keep this to avoid stale local flags if there was no actual Binance position
+            with trades_lock:
+                for k in list(trades.keys()):
+                    if k.startswith(f"{symbol}_") or k == symbol:
+                        trades[k]["exit_signal_received"] = True
+            reset_2bar_state(symbol)
             return jsonify(result)
 
         else:
