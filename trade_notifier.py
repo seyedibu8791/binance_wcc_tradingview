@@ -67,9 +67,8 @@ Entry Price: <b>{filled_price}</b>
     print(f"[ENTRY FILLED] {symbol} {side.upper()} @ {filled_price} ({interval})")
 
 
-
 # ==============================
-# 🟥 LOG TRADE EXIT (Updated with leverage-based %)
+# 🟥 LOG TRADE EXIT (Final - with leverage % + entry fallback)
 # ==============================
 def log_trade_exit(
     symbol: str,
@@ -80,18 +79,39 @@ def log_trade_exit(
     interval: str = "1m",
     order_id: str | None = None,
 ):
-    """Store exit + send Telegram alert"""
+    """Store exit + send Telegram alert (always show entry, with leverage-based %)"""
     key = f"{symbol}_{interval.lower()}"
+    entry_price = None
 
     with trades_lock:
         trade = trades.get(key)
-        if not trade or trade.get("closed"):
+        if trade and not trade.get("closed"):
+            entry_price = trade.get("entry_price")
+            trade["exit_price"] = filled_price
+            trade["pnl"] = pnl
+            trade["pnl_percent"] = pnl_percent
+            trade["closed"] = True
+        else:
             print(f"⚠️ log_trade_exit: no active trade found for {symbol}")
-            return
-        trade["exit_price"] = filled_price
-        trade["pnl"] = pnl
-        trade["pnl_percent"] = pnl_percent
-        trade["closed"] = True
+            # 🧭 fallback - try retrieving last known entry from Binance API
+            try:
+                import requests
+                from config import BINANCE_API_KEY, BINANCE_API_SECRET
+
+                url = "https://fapi.binance.com/fapi/v2/positionRisk"
+                headers = {"X-MBX-APIKEY": BINANCE_API_KEY}
+                res = requests.get(url, headers=headers, timeout=10)
+                if res.status_code == 200:
+                    positions = res.json()
+                    for p in positions:
+                        if p["symbol"].upper() == symbol.upper() and float(p["positionAmt"]) != 0:
+                            entry_price = float(p["entryPrice"])
+                            break
+            except Exception as e:
+                print(f"⚠️ Binance entry fetch failed: {e}")
+
+    # Use placeholder if nothing found
+    entry_price_display = entry_price if entry_price else "?"
 
     # 🧮 Adjust displayed PnL% with leverage
     leveraged_pnl_percent = round(pnl_percent * LEVERAGE, 2)
@@ -105,14 +125,15 @@ PnL: <b>{pnl}$</b> | <b>{leveraged_pnl_percent}%</b>
 Symbol: <b>#{symbol}</b>
 Interval: <b>{interval}</b>
 --- ⌁ ---
-Entry: {trade.get('entry_price', '?')}
+Entry: {entry_price_display}
 Exit: {filled_price}"""
 
     if order_id:
         msg += f"\nOrder ID: <b>{order_id}</b>"
 
     send_telegram_message(msg)
-    print(f"[EXIT] {symbol} closed @ {filled_price} | PnL: {pnl}$ ({leveraged_pnl_percent}%) | Reason: {reason}")
+    print(f"[EXIT] {symbol} closed @ {filled_price} | Entry={entry_price_display} | PnL: {pnl}$ ({leveraged_pnl_percent}%) | Reason: {reason}")
+
 
 # ==============================
 # ⏱️ INTERVAL TO SECONDS
