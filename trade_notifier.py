@@ -69,7 +69,7 @@ Entry Price: <b>{filled_price}</b>
 
 
 # ==============================
-# 🟥 LOG TRADE EXIT
+# 🟥 LOG TRADE EXIT (Updated with leverage-based %)
 # ==============================
 def log_trade_exit(
     symbol: str,
@@ -93,11 +93,14 @@ def log_trade_exit(
         trade["pnl_percent"] = pnl_percent
         trade["closed"] = True
 
+    # 🧮 Adjust displayed PnL% with leverage
+    leveraged_pnl_percent = round(pnl_percent * LEVERAGE, 2)
+
     header = "✅ Profit Achieved!" if pnl >= 0 else "⛔️ Ended in Loss!"
 
     msg = f"""{header}
 Reason: <b>{reason}</b>
-PnL: <b>{pnl}$</b> | <b>{pnl_percent}%</b>
+PnL: <b>{pnl}$</b> | <b>{leveraged_pnl_percent}%</b>
 --- ⌁ ---
 Symbol: <b>#{symbol}</b>
 Interval: <b>{interval}</b>
@@ -109,8 +112,7 @@ Exit: {filled_price}"""
         msg += f"\nOrder ID: <b>{order_id}</b>"
 
     send_telegram_message(msg)
-    print(f"[EXIT] {symbol} closed @ {filled_price} | PnL: {pnl}$ ({pnl_percent}%) | Reason: {reason}")
-
+    print(f"[EXIT] {symbol} closed @ {filled_price} | PnL: {pnl}$ ({leveraged_pnl_percent}%) | Reason: {reason}")
 
 # ==============================
 # ⏱️ INTERVAL TO SECONDS
