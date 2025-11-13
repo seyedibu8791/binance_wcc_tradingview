@@ -41,7 +41,7 @@ OPPOSITE_CLOSE_DELAY = int(os.getenv("OPPOSITE_CLOSE_DELAY", "3")) # Delay betwe
 # 🔹 EXIT ORDER PARAMETERS
 # ==============================
 # Delay before executing a market exit (in seconds)
-EXIT_MARKET_DELAY_ENABLED = os.getenv("EXIT_MARKET_DELAY_ENABLED", "True") == "True"
+EXIT_MARKET_DELAY_ENABLED = os.getenv("EXIT_MARKET_DELAY_ENABLED", "False") == "True"
 EXIT_MARKET_DELAY         = int(os.getenv("EXIT_MARKET_DELAY", "3"))
 
 # Use bar high/low for limit exit with timeout fallback to market
